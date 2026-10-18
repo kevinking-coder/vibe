@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "Vibed",
+    "slug": "vibed",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "scheme": "vibed",
+    "android": {
+      "package": "com.vibed.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0A0A0C"
+      }
+    }
+  }
+}
