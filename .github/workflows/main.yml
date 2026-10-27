@@ -30,6 +30,21 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Install Expo SDK modules
+        run: npx expo install expo-image-picker expo-video
+
+      - name: Verify Expo SDK modules
+        run: |
+          node <<'NODE'
+          const dependencies = require('./package.json').dependencies;
+          for (const name of ['expo-image-picker', 'expo-video']) {
+            if (!dependencies?.[name]) {
+              throw new Error(`${name} must be declared in dependencies.`);
+            }
+            console.log(`${name}:`, require.resolve(name));
+          }
+          NODE
+
       - name: Verify Babel preset
         run: |
           node <<'NODE'
