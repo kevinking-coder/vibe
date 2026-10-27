@@ -97,4 +97,4 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
           NODE
         env:
-          BUILD_PROFILE: ${{ steps.profile.output
+          BUILD_PROFILE: ${{ steps.profile.outputs.name }}
