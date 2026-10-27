@@ -85,7 +85,7 @@ jobs:
             throw new Error('EAS completed without returning a build ID and artifact download URL.');
           }
 
-          const buildPageUrl = `https://expo.dev/accounts/brak.iddy/projects/congo-app/builds/${buildId}`;
+          const buildPageUrl = `https://expo.dev/accounts/brak.iddy/projects/vibe/builds/${buildId}`;
           const summary = profile === 'production'
             ? `## Android production AAB\n\n` +
               `- [Download AAB](${artifactUrl}) and upload it to Google Play Console.\n` +
