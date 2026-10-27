@@ -1,0 +1,100 @@
+name: EAS Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_profile:
+        description: Android build type
+        required: true
+        type: choice
+        options:
+          - production
+          - preview
+        default: production
+
+jobs:
+  android-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify Babel preset
+        run: |
+          node <<'NODE'
+          const dependencies = require('./package.json').dependencies;
+          if (!dependencies?.['babel-preset-expo']) {
+            throw new Error('babel-preset-expo must be declared in dependencies for EAS production builds.');
+          }
+          console.log('Resolved Babel preset:', require.resolve('babel-preset-expo'));
+          NODE
+
+      - name: Verify Expo icon assets
+        run: |
+          if [ ! -f assets/icon.png ]; then
+            echo "::error::assets/icon.png is missing. Add and push the app icon before building."
+            exit 1
+          fi
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Install EAS CLI
+        run: npm install -g eas-cli
+
+      - name: Select Android build profile
+        id: profile
+        env:
+          REQUESTED_PROFILE: ${{ inputs.build_profile }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "name=$REQUESTED_PROFILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=preview" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build Android artifact with EAS
+        run: eas build --platform android --non-interactive --wait --json --profile "${{ steps.profile.outputs.name }}" > eas-build.json
+        env:
+          EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
+          BUILD_PROFILE: ${{ steps.profile.outputs.name }}
+
+      - name: Add build download links to summary
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const builds = JSON.parse(fs.readFileSync('eas-build.json', 'utf8'));
+          const build = Array.isArray(builds) ? builds[0] : builds;
+          const buildId = build?.id;
+          const artifactUrl = build?.artifacts?.buildUrl;
+          const profile = process.env.BUILD_PROFILE;
+
+          if (!buildId || !artifactUrl) {
+            throw new Error('EAS completed without returning a build ID and artifact download URL.');
+          }
+
+          const buildPageUrl = `https://expo.dev/accounts/brak.iddy/projects/congo-app/builds/${buildId}`;
+          const summary = profile === 'production'
+            ? `## Android production AAB\n\n` +
+              `- [Download AAB](${artifactUrl}) and upload it to Google Play Console.\n` +
+              `- [Open EAS build page](${buildPageUrl}) for build details.\n`
+            : `## Android preview APK\n\n` +
+              `- [Download APK](${artifactUrl}) — open this link on your Android phone to install the preview.\n` +
+              `- [Open EAS build page](${buildPageUrl}) for build details and the installation QR code.\n`;
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, summary);
+          NODE
+        env:
+          BUILD_PROFILE: ${{ steps.profile.output
