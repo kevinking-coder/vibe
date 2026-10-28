@@ -1,334 +1,465 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Alert,
+  Image,
+  Linking,
+  Modal,
   Pressable,
+  Share,
   StyleSheet,
   Text,
   View,
 } from "react-native";
-import * as ImagePicker from "expo-image-picker";
+import { Ionicons } from "@expo/vector-icons";
 import type { Session } from "@supabase/supabase-js";
 
-import { Avatar, Button, colors, EmptyState, Field, Screen } from "../components/ui";
-import { VIBE_THEMES, type VibeName } from "../config/vibes";
-import { uploadAvatar } from "../services/media";
+import { Avatar, Button, colors, EmptyState, Screen, VibeChip } from "../components/ui";
+import { VIBES, type VibeName } from "../config/vibes";
+import { EditProfileScreen } from "./EditProfileScreen";
+import { SettingsScreen } from "./SettingsScreen";
 import { supabase } from "../services/supabase";
-import type { UserProfile } from "../types/app";
+import type { FeedVideo, UserProfile } from "../types/app";
 
-type VideoSummary = { id: string; caption: string; vibe_tag: string; like_count: number; view_count: number };
-type BlockedProfile = Pick<UserProfile, "id" | "username" | "display_name" | "avatar_url">;
-const vibes = Object.keys(VIBE_THEMES) as VibeName[];
+type ProfileTab = "Videos" | "Photos" | "Liked" | "Saved";
+const profileTabs: { key: ProfileTab; icon: keyof typeof Ionicons.glyphMap }[] = [
+  { key: "Videos", icon: "play-circle-outline" },
+  { key: "Photos", icon: "images-outline" },
+  { key: "Liked", icon: "heart-outline" },
+  { key: "Saved", icon: "bookmark-outline" },
+];
 
-export function ProfileScreen({
+type ProfileScreenProps = {
+  session: Session;
+  profile: UserProfile;
+  creatorUsername?: string;
+  onProfileUpdated: (profile: UserProfile) => void;
+  onMessageCreator: (contactId: string) => void;
+  onClosePublicProfile: () => void;
+};
+
+export function ProfileScreen(props: ProfileScreenProps) {
+  if (props.creatorUsername && props.creatorUsername !== props.profile.username) {
+    return (
+      <CreatorProfileScreen
+        session={props.session}
+        username={props.creatorUsername}
+        onMessage={props.onMessageCreator}
+        onClose={props.onClosePublicProfile}
+      />
+    );
+  }
+  return <OwnProfileScreen {...props} />;
+}
+
+function OwnProfileScreen({
   session,
   profile,
   onProfileUpdated,
+  creatorUsername: _creatorUsername,
+  onMessageCreator: _onMessageCreator,
+  onClosePublicProfile: _onClosePublicProfile,
 }: {
   session: Session;
   profile: UserProfile;
   onProfileUpdated: (profile: UserProfile) => void;
+  creatorUsername?: string;
+  onMessageCreator: (contactId: string) => void;
+  onClosePublicProfile: () => void;
 }) {
-  const [editing, setEditing] = useState(false);
-  const [displayName, setDisplayName] = useState(profile.display_name);
-  const [bio, setBio] = useState(profile.bio);
-  const [vibeTags, setVibeTags] = useState(profile.vibe_tags);
-  const [hardMuted, setHardMuted] = useState(profile.hard_muted_vibes);
-  const [videos, setVideos] = useState<VideoSummary[]>([]);
-  const [followerCount, setFollowerCount] = useState(0);
-  const [followingCount, setFollowingCount] = useState(0);
-  const [blocked, setBlocked] = useState<BlockedProfile[]>([]);
-  const [showBlocked, setShowBlocked] = useState(false);
+  const [posts, setPosts] = useState<FeedVideo[]>([]);
+  const [likedIds, setLikedIds] = useState<string[]>([]);
+  const [savedIds, setSavedIds] = useState<string[]>([]);
+  const [followers, setFollowers] = useState(0);
+  const [following, setFollowing] = useState(0);
+  const [tab, setTab] = useState<ProfileTab>("Videos");
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [settingsVisible, setSettingsVisible] = useState(false);
+  const [editing, setEditing] = useState(false);
 
-  const loadProfileData = useCallback(async () => {
+  const load = useCallback(async () => {
+    setError(null);
     setLoading(true);
     try {
-      const [videosResult, followersResult, followingResult, blocksResult] = await Promise.all([
-        supabase.from("videos").select("id, caption, vibe_tag, like_count, view_count").eq("user_id", session.user.id).eq("suppressed", false).order("created_at", { ascending: false }),
+      const [postsResult, followersResult, followingResult, likesResult, savesResult] = await Promise.all([
+        supabase.from("videos")
+          .select("id, user_id, optimized_url, media_urls, media_type, visibility, allow_comments, allow_sharing, caption, genre_tag, vibe_tag, audio_attribution, duration_ms, view_count, like_count, created_at, cover_url")
+          .eq("user_id", session.user.id)
+          .eq("suppressed", false)
+          .order("created_at", { ascending: false }),
         supabase.from("vibe_followers").select("id", { count: "exact", head: true }).eq("followed_id", session.user.id),
         supabase.from("vibe_followers").select("id", { count: "exact", head: true }).eq("follower_id", session.user.id),
-        supabase.from("blocked_users").select("blocked_id").eq("blocker_id", session.user.id),
+        supabase.from("engagements").select("video_id").eq("user_id", session.user.id).eq("event_type", "like"),
+        supabase.from("saved_posts").select("video_id").eq("user_id", session.user.id),
       ]);
-      if (videosResult.error) throw videosResult.error;
+      if (postsResult.error) throw postsResult.error;
       if (followersResult.error) throw followersResult.error;
       if (followingResult.error) throw followingResult.error;
-      if (blocksResult.error) throw blocksResult.error;
+      if (likesResult.error) throw likesResult.error;
+      if (savesResult.error) throw savesResult.error;
 
-      const blockedIds = (blocksResult.data ?? []).map((item) => item.blocked_id);
-      let blockedProfiles: BlockedProfile[] = [];
-      if (blockedIds.length) {
-        const { data, error } = await supabase
-          .from("users")
+      const nextPosts = (postsResult.data ?? []) as FeedVideo[];
+      const ids = nextPosts.map((post) => post.id);
+      setPosts(nextPosts);
+      setFollowers(followersResult.count ?? 0);
+      setFollowing(followingResult.count ?? 0);
+      setLikedIds((likesResult.data ?? []).map((item) => item.video_id));
+      setSavedIds((savesResult.data ?? []).map((item) => item.video_id));
+      if (ids.length) {
+        const { data: creators, error: creatorsError } = await supabase.from("users")
           .select("id, username, display_name, avatar_url")
-          .in("id", blockedIds);
-        if (error) throw error;
-        blockedProfiles = (data ?? []) as BlockedProfile[];
+          .in("id", [...new Set(nextPosts.map((post) => post.user_id))]);
+        if (creatorsError) throw creatorsError;
+        const byId = new Map((creators ?? []).map((creator) => [creator.id, creator]));
+        setPosts(nextPosts.map((post) => ({
+          ...post,
+          username: byId.get(post.user_id)?.username ?? profile.username,
+          display_name: byId.get(post.user_id)?.display_name ?? profile.display_name,
+          avatar_url: byId.get(post.user_id)?.avatar_url ?? profile.avatar_url,
+        })));
       }
-
-      setVideos((videosResult.data ?? []) as VideoSummary[]);
-      setFollowerCount(followersResult.count ?? 0);
-      setFollowingCount(followingResult.count ?? 0);
-      setBlocked(blockedProfiles);
-    } catch (error) {
-      Alert.alert("Could not load profile details", error instanceof Error ? error.message : "Please try again.");
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Your profile could not be loaded.");
     } finally {
       setLoading(false);
     }
-  }, [session.user.id]);
+  }, [profile.avatar_url, profile.display_name, profile.username, session.user.id]);
 
-  useEffect(() => {
-    void loadProfileData();
-  }, [loadProfileData]);
+  useEffect(() => { void load(); }, [load]);
 
-  useEffect(() => {
-    setDisplayName(profile.display_name);
-    setBio(profile.bio);
-    setVibeTags(profile.vibe_tags);
-    setHardMuted(profile.hard_muted_vibes);
-  }, [profile]);
+  const visiblePosts = useMemo(() => {
+    if (tab === "Photos") return posts.filter((post) => post.media_type === "photo");
+    if (tab === "Videos") return posts.filter((post) => post.media_type !== "photo");
+    if (tab === "Liked") return posts.filter((post) => likedIds.includes(post.id));
+    return posts.filter((post) => savedIds.includes(post.id));
+  }, [likedIds, posts, savedIds, tab]);
 
-  function toggleList(list: string[], setList: (values: string[]) => void, value: string) {
-    setList(list.includes(value) ? list.filter((item) => item !== value) : [...list, value]);
-  }
+  const totalLikes = posts.reduce((total, post) => total + post.like_count, 0);
+  const postCount = posts.length;
 
-  async function saveProfile() {
-    if (!displayName.trim()) {
-      Alert.alert("Add a display name", "Your display name can’t be empty.");
-      return;
-    }
-    setBusy(true);
+  async function shareProfile() {
+    const link = `vibed://creator/${profile.username}`;
     try {
-      const updates = {
-        display_name: displayName.trim(),
-        bio: bio.trim(),
-        vibe_tags: vibeTags,
-        hard_muted_vibes: hardMuted,
-      };
-      const { error } = await supabase.from("users").update(updates).eq("id", session.user.id);
-      if (error) throw error;
-      onProfileUpdated({ ...profile, ...updates });
-      setEditing(false);
-    } catch (error) {
-      Alert.alert("Profile not saved", error instanceof Error ? error.message : "Please try again.");
-    } finally {
-      setBusy(false);
+      await Share.share({ title: `${profile.display_name} on Vibed`, message: `Check out @${profile.username} on Vibed: ${link}`, url: link });
+    } catch (shareError) {
+      Alert.alert("Could not share profile", shareError instanceof Error ? shareError.message : "Please try again.");
     }
-  }
-
-  async function changeAvatar() {
-    try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        Alert.alert("Allow photo access", "Vibed needs photo library access to update your profile picture.");
-        return;
-      }
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images"],
-        allowsEditing: true,
-        aspect: [1, 1],
-        quality: 0.85,
-      });
-      if (result.canceled) return;
-
-      setBusy(true);
-      const avatarUrl = await uploadAvatar(result.assets[0], session.user.id);
-      const { error } = await supabase.from("users").update({ avatar_url: avatarUrl }).eq("id", session.user.id);
-      if (error) throw error;
-      onProfileUpdated({ ...profile, avatar_url: avatarUrl });
-    } catch (error) {
-      Alert.alert("Could not update your photo", error instanceof Error ? error.message : "Please try again.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function unblock(user: BlockedProfile) {
-    Alert.alert("Unblock this account?", `${user.username} may appear in your feed again.`, [
-      { text: "Cancel", style: "cancel" },
-      {
-        text: "Unblock",
-        onPress: () => {
-          void supabase.from("blocked_users").delete()
-            .eq("blocker_id", session.user.id)
-            .eq("blocked_id", user.id)
-            .then(({ error }) => {
-              if (error) Alert.alert("Could not unblock account", error.message);
-              else setBlocked((current) => current.filter((item) => item.id !== user.id));
-            });
-        },
-      },
-    ]);
   }
 
   function signOut() {
-    Alert.alert("Sign out?", "You can sign back in anytime.", [
+    Alert.alert("Log out?", "You can log back in anytime.", [
       { text: "Cancel", style: "cancel" },
       {
-        text: "Sign out",
+        text: "Log out",
         style: "destructive",
         onPress: () => {
-          void supabase.auth.signOut().then(({ error }) => {
-            if (error) Alert.alert("Sign-out failed", error.message);
+          void supabase.auth.signOut().then(({ error: signOutError }) => {
+            if (signOutError) Alert.alert("Log out failed", signOutError.message);
           });
         },
       },
     ]);
   }
 
-  const totalLikes = videos.reduce((sum, video) => sum + video.like_count, 0);
-  const totalViews = videos.reduce((sum, video) => sum + video.view_count, 0);
+  return (
+    <>
+      <Screen scroll>
+        <View style={styles.container}>
+          <View style={styles.topBar}>
+            <Text style={styles.topTitle}>Profile</Text>
+            <Pressable onPress={() => setSettingsVisible(true)} style={styles.iconButton} accessibilityLabel="Open settings">
+              <Ionicons name="menu-outline" size={25} color={colors.text} />
+            </Pressable>
+          </View>
+          <View style={styles.cover}>
+            {profile.cover_url ? <Image source={{ uri: profile.cover_url }} style={styles.coverPhoto} /> : null}
+            <View style={styles.coverGradient} />
+            <Avatar uri={profile.avatar_url} label={profile.display_name || profile.username} size={88} />
+          </View>
+          <View style={styles.identity}>
+            <Text style={styles.displayName}>{profile.display_name || profile.username}</Text>
+            <Text style={styles.username}>@{profile.username}</Text>
+            {profile.bio ? <Text style={styles.bio}>{profile.bio}</Text> : <Text style={styles.bioHint}>Add a bio to tell people about yourself.</Text>}
+            {profile.website ? <Text style={styles.website}>{profile.website}</Text> : null}
+            <View style={styles.stats}>
+              <Stat value={following} label="Following" />
+              <Stat value={followers} label="Followers" />
+              <Stat value={totalLikes} label="Likes" />
+            </View>
+            <View style={styles.profileButtons}>
+              <Button variant="secondary" style={styles.profileButton} onPress={() => setEditing(true)}>Edit profile</Button>
+              <Button variant="secondary" style={styles.shareButton} onPress={() => void shareProfile()}>
+                <Ionicons name="share-outline" size={18} color={colors.text} />
+              </Button>
+            </View>
+          </View>
+          {profile.vibe_tags.length ? (
+            <View style={styles.knownVibes}>
+              <Text style={styles.sectionTitle}>Known for</Text>
+              <View style={styles.chips}>
+                {profile.vibe_tags.filter((vibe): vibe is typeof VIBES[number] => VIBES.includes(vibe as typeof VIBES[number])).map((vibe) => (
+                  <VibeChip key={vibe} vibe={vibe} compact />
+                ))}
+              </View>
+            </View>
+          ) : null}
+          <View style={styles.tabs}>
+            {profileTabs.map((item) => (
+              <Pressable key={item.key} onPress={() => setTab(item.key)} style={[styles.tab, tab === item.key && styles.activeTab]}>
+                <Ionicons name={item.icon} size={20} color={tab === item.key ? colors.mint : colors.muted} />
+                <Text style={[styles.tabText, tab === item.key && styles.activeTabText]}>{item.key}</Text>
+              </Pressable>
+            ))}
+          </View>
+          {loading ? (
+            <EmptyState title="Loading your posts…" body="Fetching videos and photos." />
+          ) : error ? (
+            <EmptyState title="Profile unavailable" body={error} action={<Button onPress={() => void load()}>Retry</Button>} />
+          ) : visiblePosts.length ? (
+            <View style={styles.grid}>
+              {visiblePosts.map((post) => <PostTile key={post.id} post={post} />)}
+            </View>
+          ) : (
+            <EmptyState
+              title={tab === "Saved" ? "No saved posts yet" : tab === "Liked" ? "No liked posts yet" : `No ${tab.toLowerCase()} yet`}
+              body={tab === "Saved" || tab === "Liked" ? "Posts you save or like will appear here. Only you can see these tabs." : "Share a moment with your Vibe Room to get started."}
+            />
+          )}
+          <Text style={styles.postCount}>{postCount} posts · {posts.reduce((count, post) => count + post.view_count, 0).toLocaleString()} views</Text>
+        </View>
+      </Screen>
+      <Modal visible={settingsVisible} animationType="slide" onRequestClose={() => setSettingsVisible(false)}>
+        <SettingsScreen
+          session={session}
+          profile={profile}
+          onProfileUpdated={onProfileUpdated}
+          onEditProfile={() => { setSettingsVisible(false); setEditing(true); }}
+          onClose={() => setSettingsVisible(false)}
+          onSignOut={signOut}
+        />
+      </Modal>
+      <Modal visible={editing} animationType="slide" onRequestClose={() => setEditing(false)}>
+        <EditProfileScreen
+          session={session}
+          profile={profile}
+          onCancel={() => setEditing(false)}
+          onSave={(updates) => {
+            onProfileUpdated(updates);
+            setEditing(false);
+          }}
+        />
+      </Modal>
+    </>
+  );
+}
+
+function CreatorProfileScreen({
+  session,
+  username,
+  onMessage,
+  onClose,
+}: {
+  session: Session;
+  username: string;
+  onMessage: (contactId: string) => void;
+  onClose: () => void;
+}) {
+  const [creator, setCreator] = useState<UserProfile | null>(null);
+  const [posts, setPosts] = useState<FeedVideo[]>([]);
+  const [followers, setFollowers] = useState(0);
+  const [following, setFollowing] = useState(0);
+  const [liked, setLiked] = useState(0);
+  const [isFollowing, setIsFollowing] = useState(false);
+  const [tab, setTab] = useState<"Videos" | "Photos">("Videos");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const { data: user, error: userError } = await supabase.from("users")
+        .select("id, username, display_name, bio, avatar_url, cover_url, website, is_private, vibe_tags, hard_muted_vibes, onboarding_complete")
+        .eq("username", username)
+        .single();
+      if (userError) throw userError;
+      const typedUser = user as UserProfile;
+      setCreator(typedUser);
+      const [followResult, followersResult, followingResult, postsResult] = await Promise.all([
+        supabase.from("vibe_followers").select("id").eq("follower_id", session.user.id).eq("followed_id", typedUser.id).maybeSingle(),
+        supabase.from("vibe_followers").select("id", { count: "exact", head: true }).eq("followed_id", typedUser.id),
+        supabase.from("vibe_followers").select("id", { count: "exact", head: true }).eq("follower_id", typedUser.id),
+        supabase.from("videos")
+          .select("id, user_id, optimized_url, media_urls, media_type, visibility, allow_comments, allow_sharing, cover_url, text_overlay, caption, genre_tag, vibe_tag, audio_attribution, duration_ms, view_count, like_count, created_at")
+          .eq("user_id", typedUser.id)
+          .eq("suppressed", false)
+          .order("created_at", { ascending: false }),
+      ]);
+      if (followResult.error) throw followResult.error;
+      if (followersResult.error) throw followersResult.error;
+      if (followingResult.error) throw followingResult.error;
+      if (postsResult.error) throw postsResult.error;
+      setIsFollowing(Boolean(followResult.data));
+      setFollowers(followersResult.count ?? 0);
+      setFollowing(followingResult.count ?? 0);
+      const nextPosts = (postsResult.data ?? []) as FeedVideo[];
+      setPosts(nextPosts);
+      setLiked(nextPosts.reduce((count, post) => count + post.like_count, 0));
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "Creator profile could not be loaded.");
+    } finally {
+      setLoading(false);
+    }
+  }, [session.user.id, username]);
+
+  useEffect(() => { void load(); }, [load]);
+
+  async function toggleFollow() {
+    if (!creator) return;
+    try {
+      const result = isFollowing
+        ? await supabase.from("vibe_followers").delete().eq("follower_id", session.user.id).eq("followed_id", creator.id)
+        : await supabase.from("vibe_followers").insert({
+            follower_id: session.user.id,
+            followed_id: creator.id,
+            source_vibe: (creator.vibe_tags[0] ?? "Chill") as VibeName,
+          });
+      if (result.error) throw result.error;
+      setIsFollowing(!isFollowing);
+      setFollowers((count) => Math.max(0, count + (isFollowing ? -1 : 1)));
+    } catch (followError) {
+      Alert.alert("Could not update follow", followError instanceof Error ? followError.message : "Please try again.");
+    }
+  }
+
+  function showOptions() {
+    if (!creator) return;
+    Alert.alert(creator.display_name || creator.username, `@${creator.username}`, [
+      {
+        text: "Report",
+        onPress: () => {
+          void supabase.from("reported_content").insert({
+            reporter_id: session.user.id,
+            reported_user_id: creator.id,
+            reason: "other",
+          }).then(({ error: reportError }) => {
+            if (reportError) Alert.alert("Report failed", reportError.message);
+            else Alert.alert("Thanks for letting us know", "Your report has been submitted.");
+          });
+        },
+      },
+      {
+        text: "Block user",
+        style: "destructive",
+        onPress: () => {
+          void supabase.from("blocked_users").insert({ blocker_id: session.user.id, blocked_id: creator.id })
+            .then(({ error: blockError }) => {
+              if (blockError) Alert.alert("Could not block account", blockError.message);
+              else onClose();
+            });
+        },
+      },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
+  const visiblePosts = posts.filter((post) => tab === "Photos" ? post.media_type === "photo" : post.media_type !== "photo");
 
   return (
     <Screen scroll>
       <View style={styles.container}>
-        <View style={styles.header}>
-          <Text style={styles.title}>Your profile</Text>
-          <Button variant="secondary" onPress={() => setEditing((value) => !value)} style={styles.editButton}>
-            {editing ? "Cancel" : "Edit"}
-          </Button>
+        <View style={styles.topBar}>
+          <Pressable onPress={onClose} style={styles.iconButton}><Ionicons name="chevron-back" size={24} color={colors.text} /></Pressable>
+          <Text style={styles.topTitle}>Creator</Text>
+          <Pressable onPress={showOptions} style={styles.iconButton}><Ionicons name="ellipsis-horizontal" size={23} color={colors.text} /></Pressable>
         </View>
-        <View style={styles.profileCard}>
-          <Pressable onPress={() => void changeAvatar()} disabled={busy} style={styles.avatarWrap}>
-            <Avatar uri={profile.avatar_url} label={profile.display_name || profile.username} size={82} />
-            <View style={styles.camera}><Text style={styles.cameraText}>＋</Text></View>
-          </Pressable>
-          <Text style={styles.displayName}>{profile.display_name || profile.username}</Text>
-          <Text style={styles.username}>@{profile.username}</Text>
-          <Text style={styles.bio}>{profile.bio || "Add a little about yourself."}</Text>
-          <View style={styles.stats}>
-            <Stat value={videos.length} label="videos" />
-            <Stat value={followerCount} label="followers" />
-            <Stat value={followingCount} label="following" />
-            <Stat value={totalLikes} label="likes" />
-          </View>
-          <Text style={styles.views}>{totalViews} total views</Text>
-        </View>
-
-        {editing ? (
-          <View style={styles.editor}>
-            <Field label="Display name" value={displayName} onChangeText={setDisplayName} maxLength={60} />
-            <Field label="Bio" value={bio} onChangeText={setBio} multiline maxLength={300} placeholder="Tell people what you’re about…" />
-            <View>
-              <Text style={styles.sectionTitle}>My vibes</Text>
-              <Text style={styles.help}>Choose the vibes you want in your feed.</Text>
-              <View style={styles.tags}>
-                {vibes.map((vibe) => (
-                  <Tag key={`vibe-${vibe}`} label={vibe} active={vibeTags.includes(vibe)} accent={VIBE_THEMES[vibe].accent} onPress={() => toggleList(vibeTags, setVibeTags, vibe)} />
-                ))}
-              </View>
-            </View>
-            <View>
-              <Text style={styles.sectionTitle}>Hard mute</Text>
-              <Text style={styles.help}>These vibes will be filtered from your feed.</Text>
-              <View style={styles.tags}>
-                {vibes.map((vibe) => (
-                  <Tag key={`mute-${vibe}`} label={vibe} active={hardMuted.includes(vibe)} accent={colors.danger} onPress={() => toggleList(hardMuted, setHardMuted, vibe)} />
-                ))}
-              </View>
-            </View>
-            <Button loading={busy} onPress={() => void saveProfile()}>Save changes</Button>
-          </View>
-        ) : null}
-
-        <View style={styles.postsHeader}>
-          <Text style={styles.sectionTitle}>Your videos</Text>
-          {loading ? <Text style={styles.help}>Loading…</Text> : null}
-        </View>
-        {!loading && videos.length === 0 ? (
-          <EmptyState title="Your first post starts here" body="Create a short video and it’ll show up on your profile and in its vibe feed." />
+        {loading ? <EmptyState title="Loading creator…" body="Fetching profile and posts." /> : error || !creator ? (
+          <EmptyState title="Profile unavailable" body={error ?? "This profile could not be found."} action={<Button onPress={() => void load()}>Retry</Button>} />
         ) : (
-          videos.map((video) => (
-            <View key={video.id} style={styles.videoRow}>
-              <View style={styles.videoMark}><Text style={styles.play}>▶</Text></View>
-              <View style={styles.videoDetails}>
-                <Text numberOfLines={2} style={styles.videoCaption}>{video.caption || "Untitled video"}</Text>
-                <Text style={styles.videoMeta}>{video.vibe_tag} · {video.view_count} views · {video.like_count} likes</Text>
+          <>
+            <View style={styles.cover}>
+              {creator.cover_url ? <Image source={{ uri: creator.cover_url }} style={styles.coverPhoto} /> : null}
+              <View style={styles.coverGradient} />
+              <Avatar uri={creator.avatar_url} label={creator.display_name || creator.username} size={88} />
+            </View>
+            <View style={styles.identity}>
+              <Text style={styles.displayName}>{creator.display_name || creator.username}</Text>
+              <Text style={styles.username}>@{creator.username}</Text>
+              {creator.bio ? <Text style={styles.bio}>{creator.bio}</Text> : null}
+              {creator.website ? <Pressable onPress={() => void Linking.openURL(creator.website ?? "")}><Text style={styles.website}>{creator.website}</Text></Pressable> : null}
+              <View style={styles.stats}>
+                <Stat value={following} label="Following" />
+                <Stat value={followers} label="Followers" />
+                <Stat value={liked} label="Likes" />
+              </View>
+              <View style={styles.profileButtons}>
+                <Button variant={isFollowing ? "secondary" : "primary"} style={styles.profileButton} onPress={() => void toggleFollow()}>{isFollowing ? "Following" : "Follow"}</Button>
+                <Button variant="secondary" style={styles.profileButton} onPress={() => onMessage(creator.id)}>Message</Button>
               </View>
             </View>
-          ))
-        )}
-
-        <View style={styles.settings}>
-          <Button variant="secondary" onPress={() => setShowBlocked((value) => !value)}>
-            {showBlocked ? "Hide blocked accounts" : `Blocked accounts (${blocked.length})`}
-          </Button>
-          {showBlocked ? blocked.map((user) => (
-            <View key={user.id} style={styles.blockedRow}>
-              <Avatar uri={user.avatar_url} label={user.display_name || user.username} size={36} />
-              <Text style={styles.blockedName}>{user.display_name || user.username}</Text>
-              <Pressable onPress={() => unblock(user)}><Text style={styles.unblock}>Unblock</Text></Pressable>
+            {creator.vibe_tags.length ? <View style={styles.knownVibes}><Text style={styles.sectionTitle}>Known for</Text><View style={styles.chips}>{creator.vibe_tags.filter((vibe): vibe is typeof VIBES[number] => VIBES.includes(vibe as typeof VIBES[number])).map((vibe) => <VibeChip key={vibe} vibe={vibe} compact />)}</View></View> : null}
+            <View style={styles.tabs}>
+              {(["Videos", "Photos"] as const).map((item) => <Pressable key={item} onPress={() => setTab(item)} style={[styles.tab, tab === item && styles.activeTab]}><Ionicons name={item === "Videos" ? "play-circle-outline" : "images-outline"} size={20} color={tab === item ? colors.mint : colors.muted} /><Text style={[styles.tabText, tab === item && styles.activeTabText]}>{item}</Text></Pressable>)}
             </View>
-          )) : null}
-          <Button variant="danger" onPress={signOut}>Sign out</Button>
-        </View>
+            {creator.is_private && !isFollowing ? <EmptyState title="This account is private" body="Follow this creator to see their posts." /> : visiblePosts.length ? <View style={styles.grid}>{visiblePosts.map((post) => <PostTile key={post.id} post={post} />)}</View> : <EmptyState title={`No ${tab.toLowerCase()} yet`} body="This creator has not shared any posts here." />}
+          </>
+        )}
       </View>
     </Screen>
   );
 }
 
 function Stat({ value, label }: { value: number; label: string }) {
+  return <View style={styles.stat}><Text style={styles.statValue}>{value.toLocaleString()}</Text><Text style={styles.statLabel}>{label}</Text></View>;
+}
+
+function PostTile({ post }: { post: FeedVideo }) {
+  const source = post.media_type === "photo" ? post.media_urls?.[0] : post.cover_url;
   return (
-    <View style={styles.stat}>
-      <Text style={styles.statValue}>{value.toLocaleString()}</Text>
-      <Text style={styles.statLabel}>{label}</Text>
+    <View style={styles.tile}>
+      {source ? <Image source={{ uri: source }} style={styles.tileImage} /> : <View style={styles.videoPlaceholder}><Ionicons name="play" size={22} color={colors.text} /></View>}
+      <View style={styles.tileOverlay}>
+        <Ionicons name={post.media_type === "photo" ? "images-outline" : "play"} size={14} color={colors.text} />
+        <Text style={styles.tileViews}>{post.view_count.toLocaleString()}</Text>
+      </View>
     </View>
   );
 }
 
-function Tag({
-  label,
-  active,
-  accent,
-  onPress,
-}: {
-  label: string;
-  active: boolean;
-  accent: string;
-  onPress: () => void;
-}) {
-  return (
-    <Pressable
-      onPress={onPress}
-      style={[styles.tag, active && { borderColor: accent, backgroundColor: `${accent}20` }]}
-    >
-      <Text style={[styles.tagText, active && { color: accent }]}>{label}</Text>
-    </Pressable>
-  );
-}
-
 const styles = StyleSheet.create({
-  container: { flex: 1, padding: 18, gap: 16 },
-  header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  title: { color: colors.text, fontSize: 28, fontWeight: "800" },
-  editButton: { minHeight: 40, paddingHorizontal: 15 },
-  profileCard: { alignItems: "center", padding: 20, borderRadius: 20, backgroundColor: colors.panel, borderWidth: 1, borderColor: colors.border },
-  avatarWrap: { position: "relative", marginBottom: 10 },
-  camera: { position: "absolute", right: 0, bottom: 0, width: 25, height: 25, borderRadius: 13, alignItems: "center", justifyContent: "center", backgroundColor: colors.accent },
-  cameraText: { color: colors.text, fontWeight: "800", fontSize: 17, lineHeight: 20 },
-  displayName: { color: colors.text, fontSize: 19, fontWeight: "800" },
-  username: { color: colors.muted, fontSize: 13, marginTop: 3 },
-  bio: { color: "#D4D4D8", fontSize: 13, textAlign: "center", marginTop: 12, lineHeight: 19 },
-  stats: { flexDirection: "row", justifyContent: "space-between", width: "100%", marginTop: 19 },
-  stat: { alignItems: "center", gap: 3 },
+  container: { gap: 14, paddingBottom: 24 },
+  topBar: { height: 38, flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  topTitle: { color: colors.text, fontSize: 20, fontWeight: "800" },
+  iconButton: { width: 40, height: 40, alignItems: "center", justifyContent: "center" },
+  cover: { height: 128, borderRadius: 18, backgroundColor: "#36204D", justifyContent: "flex-end", padding: 14 },
+  coverPhoto: { ...StyleSheet.absoluteFillObject, width: undefined, height: undefined, borderRadius: 18 },
+  coverGradient: { ...StyleSheet.absoluteFillObject, borderRadius: 18, backgroundColor: "rgba(10,10,12,0.13)" },
+  identity: { alignItems: "center", gap: 5, marginTop: -4 },
+  displayName: { color: colors.text, fontSize: 21, fontWeight: "800" },
+  username: { color: colors.muted, fontSize: 13 },
+  bio: { maxWidth: "90%", color: colors.text, textAlign: "center", fontSize: 13, lineHeight: 19, marginTop: 4 },
+  bioHint: { color: colors.muted, fontSize: 13, marginTop: 4 },
+  website: { color: colors.mint, fontSize: 12, marginTop: 2 },
+  stats: { flexDirection: "row", justifyContent: "space-evenly", width: "100%", marginTop: 8 },
+  stat: { alignItems: "center", gap: 2, minWidth: 75 },
   statValue: { color: colors.text, fontSize: 16, fontWeight: "800" },
   statLabel: { color: colors.muted, fontSize: 11 },
-  views: { color: colors.muted, fontSize: 12, marginTop: 10 },
-  editor: { gap: 14, padding: 15, borderRadius: 18, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.panel },
-  sectionTitle: { color: colors.text, fontSize: 16, fontWeight: "800" },
-  help: { color: colors.muted, fontSize: 12, marginTop: 3 },
-  tags: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
-  tag: { paddingVertical: 8, paddingHorizontal: 11, borderWidth: 1, borderColor: colors.border, borderRadius: 15, backgroundColor: colors.panelRaised },
-  tagText: { color: colors.muted, fontSize: 12, fontWeight: "700" },
-  postsHeader: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
-  videoRow: { flexDirection: "row", alignItems: "center", gap: 12, padding: 11, borderRadius: 14, backgroundColor: colors.panel },
-  videoMark: { width: 50, height: 50, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: "#342044" },
-  play: { color: colors.mint, fontSize: 17 },
-  videoDetails: { flex: 1, gap: 6 },
-  videoCaption: { color: colors.text, fontSize: 13, fontWeight: "600" },
-  videoMeta: { color: colors.muted, fontSize: 11 },
-  settings: { gap: 10, paddingTop: 4, paddingBottom: 20 },
-  blockedRow: { flexDirection: "row", alignItems: "center", gap: 10, padding: 10, borderRadius: 12, backgroundColor: colors.panel },
-  blockedName: { flex: 1, color: colors.text, fontSize: 13, fontWeight: "600" },
-  unblock: { color: colors.mint, fontWeight: "700", padding: 6 },
+  profileButtons: { flexDirection: "row", gap: 8, marginTop: 8 },
+  profileButton: { minHeight: 40, minWidth: 150 },
+  shareButton: { width: 44, minHeight: 40, paddingHorizontal: 0 },
+  knownVibes: { gap: 8 },
+  sectionTitle: { color: colors.text, fontSize: 14, fontWeight: "800" },
+  chips: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  tabs: { flexDirection: "row", justifyContent: "space-around", borderBottomWidth: 1, borderColor: colors.border, marginTop: 4 },
+  tab: { flex: 1, alignItems: "center", gap: 5, paddingVertical: 11 },
+  activeTab: { borderBottomWidth: 2, borderColor: colors.mint },
+  tabText: { color: colors.muted, fontSize: 10, fontWeight: "700" },
+  activeTabText: { color: colors.mint },
+  grid: { flexDirection: "row", flexWrap: "wrap", gap: 3 },
+  tile: { width: "32.8%", aspectRatio: 0.76, backgroundColor: colors.panel, borderRadius: 5, overflow: "hidden" },
+  tileImage: { width: "100%", height: "100%" },
+  videoPlaceholder: { flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#30213D" },
+  tileOverlay: { position: "absolute", bottom: 6, left: 6, flexDirection: "row", gap: 4, alignItems: "center", paddingHorizontal: 5, paddingVertical: 3, borderRadius: 6, backgroundColor: "rgba(0,0,0,0.55)" },
+  tileViews: { color: colors.text, fontSize: 10, fontWeight: "700" },
+  postCount: { color: colors.muted, fontSize: 11, textAlign: "center" },
 });

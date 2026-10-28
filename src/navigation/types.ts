@@ -3,9 +3,9 @@ export type RootStackParamList = {
 };
 
 export type MainTabParamList = {
-  Home: undefined;
+  Home: { postId?: string } | undefined;
   Discover: undefined;
   Upload: undefined;
-  Inbox: undefined;
-  Profile: undefined;
+  Inbox: { contactId?: string } | undefined;
+  Profile: { username?: string } | undefined;
 };

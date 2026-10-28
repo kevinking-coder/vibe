@@ -1,46 +1,56 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
+  Animated,
   Dimensions,
   FlatList,
-  KeyboardAvoidingView,
-  Modal,
+  Image,
   Pressable,
   RefreshControl,
+  ScrollView,
   StyleSheet,
   Text,
-  TextInput,
   View,
   type ViewToken,
 } from "react-native";
-import { Platform } from "react-native";
 import { VideoView, useVideoPlayer } from "expo-video";
+import { Ionicons } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
 import type { Session } from "@supabase/supabase-js";
 
-import { Avatar, Button, colors, EmptyState } from "../components/ui";
-import { VIBE_THEMES, type VibeName } from "../config/vibes";
+import { Button, colors, EmptyState, VibeChip } from "../components/ui";
+import { PostActions } from "../components/PostActions";
+import { PostSheets } from "../components/PostSheets";
+import { VIBES, VIBE_THEMES, type VibeName } from "../config/vibes";
 import { supabase } from "../services/supabase";
+import { useAppStore } from "../store/appStore";
 import type { FeedVideo, UserProfile } from "../types/app";
 
-const knownVibes = Object.keys(VIBE_THEMES) as VibeName[];
-const viewportHeight = Dimensions.get("window").height - 175;
+const viewportHeight = Dimensions.get("window").height - 180;
 const viewabilityConfig = { itemVisiblePercentThreshold: 70 };
 
 export function HomeScreen({
   session,
   profile,
+  deepLinkPostId,
+  onDeepLinkHandled,
 }: {
   session: Session;
   profile: UserProfile;
+  deepLinkPostId?: string;
+  onDeepLinkHandled: () => void;
 }) {
-  const firstVibe = profile.vibe_tags.find((vibe): vibe is VibeName =>
-    knownVibes.includes(vibe as VibeName),
-  ) ?? "Chill";
-  const [vibe, setVibe] = useState<VibeName>(firstVibe);
-  const [videos, setVideos] = useState<FeedVideo[]>([]);
+  const globalVibe = useAppStore((state) => state.activeVibeRoom);
+  const setGlobalVibe = useAppStore((state) => state.setActiveVibeRoom);
+  const autoplay = useAppStore((state) => state.settings.autoplay);
+  const [vibe, setVibe] = useState<VibeName>(globalVibe);
+  const [posts, setPosts] = useState<FeedVideo[]>([]);
+  const [pinnedPost, setPinnedPost] = useState<FeedVideo | null>(null);
   const [likedIds, setLikedIds] = useState<Set<string>>(new Set());
+  const [savedIds, setSavedIds] = useState<Set<string>>(new Set());
+  const [commentCounts, setCommentCounts] = useState<Record<string, number>>({});
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [commentVideo, setCommentVideo] = useState<FeedVideo | null>(null);
+  const [sheet, setSheet] = useState<{ post: FeedVideo; type: "comments" | "share" | "more" | "report" } | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -48,17 +58,18 @@ export function HomeScreen({
   const viewedIds = useRef(new Set<string>());
   const cursor = useRef<string | null>(null);
   const loadingMoreRef = useRef(false);
-  const feedGeneration = useRef(0);
+  const generation = useRef(0);
+  const handledDeepLinkId = useRef<string | null>(null);
 
   const loadFeed = useCallback(async (append = false) => {
     if (append && (!cursor.current || loadingMoreRef.current)) return;
-    if (!append) feedGeneration.current += 1;
-    const generation = feedGeneration.current;
-    setError(null);
+    if (!append) generation.current += 1;
+    const requestId = generation.current;
     if (append) {
       loadingMoreRef.current = true;
       setLoadingMore(true);
     }
+    setError(null);
     try {
       const { data, error: feedError } = await supabase.rpc("get_vibe_feed", {
         p_vibe_tag: vibe,
@@ -66,55 +77,101 @@ export function HomeScreen({
         p_before: append ? cursor.current : null,
       });
       if (feedError) throw feedError;
-      if (generation !== feedGeneration.current) return;
-      const items = (data ?? []) as FeedVideo[];
-      const lastItem = items[items.length - 1];
-      cursor.current = lastItem?.created_at ?? null;
-      if (append) {
-        setVideos((current) => [...current, ...items]);
-      } else {
-        setVideos(items);
-        setActiveId(items[0]?.id ?? null);
+      if (requestId !== generation.current) return;
+      let page = (data ?? []) as FeedVideo[];
+      if (!append && deepLinkPostId && handledDeepLinkId.current !== deepLinkPostId) {
+        const { data: target, error: targetError } = await supabase.from("videos")
+          .select("id, user_id, optimized_url, media_urls, media_type, visibility, allow_comments, allow_sharing, cover_url, text_overlay, caption, genre_tag, vibe_tag, audio_attribution, duration_ms, view_count, like_count, created_at")
+          .eq("id", deepLinkPostId)
+          .single();
+        if (targetError) throw targetError;
+        if (target.vibe_tag !== vibe) {
+          if (!VIBES.includes(target.vibe_tag as VibeName)) throw new Error("This post has an unsupported vibe tag.");
+          setVibe(target.vibe_tag as VibeName);
+          return;
+        }
+        const { data: creator, error: creatorError } = await supabase.from("users")
+          .select("username, display_name, avatar_url")
+          .eq("id", target.user_id)
+          .single();
+        if (creatorError) throw creatorError;
+        const targetPost = {
+          ...target,
+          username: creator.username,
+          display_name: creator.display_name,
+          avatar_url: creator.avatar_url,
+        } as FeedVideo;
+        setPinnedPost(targetPost);
+        handledDeepLinkId.current = deepLinkPostId;
+        if (!page.some((post) => post.id === targetPost.id)) page = [targetPost, ...page];
+        onDeepLinkHandled();
+      }
+      if (!append && pinnedPost?.vibe_tag === vibe && !page.some((post) => post.id === pinnedPost.id)) {
+        page = [pinnedPost, ...page];
+      }
+      cursor.current = page[page.length - 1]?.created_at ?? null;
+      if (append) setPosts((current) => [...current, ...page]);
+      else {
+        setPosts(page);
+        setActiveId(page[0]?.id ?? null);
         viewedIds.current.clear();
       }
-      if (items.length) {
-        const { data: likes, error: likeError } = await supabase
-          .from("engagements")
-          .select("video_id")
-          .eq("user_id", session.user.id)
-          .eq("event_type", "like")
-          .in("video_id", items.map((item) => item.id));
-        if (likeError) throw likeError;
-        setLikedIds((current) =>
-          append
-            ? new Set([...current, ...(likes ?? []).map((item) => item.video_id)])
-            : new Set((likes ?? []).map((item) => item.video_id)),
-        );
+
+      const ids = page.map((post) => post.id);
+      if (ids.length) {
+        const [likesResult, savedResult, commentsResult] = await Promise.all([
+          supabase.from("engagements").select("video_id").eq("user_id", session.user.id).eq("event_type", "like").in("video_id", ids),
+          supabase.from("saved_posts").select("video_id").eq("user_id", session.user.id).in("video_id", ids),
+          supabase.from("comments").select("video_id").in("video_id", ids),
+        ]);
+        if (likesResult.error) throw likesResult.error;
+        if (savedResult.error) throw savedResult.error;
+        if (commentsResult.error) throw commentsResult.error;
+        const likes = (likesResult.data ?? []).map((item) => item.video_id);
+        const saved = (savedResult.data ?? []).map((item) => item.video_id);
+        const counts: Record<string, number> = {};
+        for (const comment of commentsResult.data ?? []) counts[comment.video_id] = (counts[comment.video_id] ?? 0) + 1;
+        setLikedIds((current) => append ? new Set([...current, ...likes]) : new Set(likes));
+        setSavedIds((current) => append ? new Set([...current, ...saved]) : new Set(saved));
+        setCommentCounts((current) => append ? { ...current, ...counts } : counts);
       } else if (!append) {
         setLikedIds(new Set());
+        setSavedIds(new Set());
+        setCommentCounts({});
       }
     } catch (loadError) {
-      if (generation === feedGeneration.current) {
-        setError(loadError instanceof Error ? loadError.message : "The feed could not be loaded.");
-        if (!append) setVideos([]);
+      if (requestId === generation.current) {
+        setError(loadError instanceof Error ? loadError.message : "The Vibe Room could not be loaded.");
+        if (!append) setPosts([]);
       }
     } finally {
       if (append) {
         loadingMoreRef.current = false;
         setLoadingMore(false);
-      }
-      else {
+      } else {
         setLoading(false);
         setRefreshing(false);
       }
     }
-  }, [session.user.id, vibe]);
+  }, [deepLinkPostId, onDeepLinkHandled, session.user.id, vibe]);
 
   useEffect(() => {
     cursor.current = null;
+    setGlobalVibe(vibe);
     setLoading(true);
-    void loadFeed();
-  }, [loadFeed]);
+    void loadFeed(false);
+  }, [loadFeed, setGlobalVibe, vibe]);
+
+  useEffect(() => {
+    if (!profile.hard_muted_vibes.includes(vibe)) return;
+    const nextVibe = VIBES.find((item) => !profile.hard_muted_vibes.includes(item));
+    if (nextVibe) setVibe(nextVibe);
+  }, [profile.hard_muted_vibes, vibe]);
+
+  const onViewableItemsChanged = useCallback(({ viewableItems }: { viewableItems: ViewToken[] }) => {
+    const visible = viewableItems.find((item) => item.isViewable);
+    if (visible?.item) setActiveId((visible.item as FeedVideo).id);
+  }, []);
 
   useEffect(() => {
     if (!activeId || viewedIds.current.has(activeId)) return;
@@ -129,113 +186,92 @@ export function HomeScreen({
     });
   }, [activeId]);
 
-  const availableVibes = useMemo(() => {
-    const followedVibes = profile.vibe_tags.filter((item): item is VibeName =>
-      knownVibes.includes(item as VibeName),
-    );
-    return followedVibes.length ? followedVibes : knownVibes;
-  }, [profile.vibe_tags]);
-  const onViewableItemsChanged = useCallback(
-    ({ viewableItems }: { viewableItems: ViewToken[] }) => {
-      const visible = viewableItems.find((item) => item.isViewable);
-      if (visible?.item) setActiveId((visible.item as FeedVideo).id);
-    },
-    [],
-  );
-
-  async function toggleLike(video: FeedVideo) {
-    const liked = likedIds.has(video.id);
+  async function toggleLike(post: FeedVideo) {
+    const liked = likedIds.has(post.id);
     try {
-      if (liked) {
-        const { error: unlikeError } = await supabase.rpc("remove_video_like", {
-          p_video_id: video.id,
-        });
-        if (unlikeError) throw unlikeError;
-      } else {
-        const { error: likeError } = await supabase.rpc("record_video_engagement", {
-          p_video_id: video.id,
-          p_event_type: "like",
-          p_watch_time_ms: 0,
-          p_completed: false,
-        });
-        if (likeError) throw likeError;
-      }
+      const { error } = liked
+        ? await supabase.rpc("remove_video_like", { p_video_id: post.id })
+        : await supabase.rpc("record_video_engagement", {
+            p_video_id: post.id,
+            p_event_type: "like",
+            p_watch_time_ms: 0,
+            p_completed: false,
+          });
+      if (error) throw error;
       setLikedIds((current) => {
         const next = new Set(current);
-        if (liked) next.delete(video.id);
-        else next.add(video.id);
+        if (liked) next.delete(post.id);
+        else next.add(post.id);
         return next;
       });
-      setVideos((current) =>
-        current.map((item) =>
-          item.id === video.id
-            ? { ...item, like_count: Math.max(0, item.like_count + (liked ? -1 : 1)) }
-            : item,
-        ),
-      );
-    } catch (likeError) {
-      Alert.alert("Could not update like", likeError instanceof Error ? likeError.message : "Please try again.");
+      setPosts((current) => current.map((item) =>
+        item.id === post.id ? { ...item, like_count: Math.max(0, item.like_count + (liked ? -1 : 1)) } : item,
+      ));
+      if (!liked) void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
+    } catch (error) {
+      Alert.alert("Could not update like", error instanceof Error ? error.message : "Please try again.");
     }
   }
 
-  function reportVideo(video: FeedVideo) {
-    Alert.alert("Report this video", "Choose a reason. Reports are reviewed by the Vibed team.", [
-      ...(["mis_tagged", "harassment", "spam", "unsafe", "other"] as const).map((reason) => ({
-        text: reason.replace("_", " "),
-        onPress: () => {
-          void supabase.from("reported_content").insert({
-            reporter_id: session.user.id,
-            video_id: video.id,
-            reason,
-          }).then(({ error: reportError }) => {
-            if (reportError) Alert.alert("Report failed", reportError.message);
-            else Alert.alert("Thanks", "Your report has been submitted.");
-          });
-        },
-      })),
-      { text: "Cancel", style: "cancel" },
-    ]);
+  async function toggleSave(post: FeedVideo) {
+    const saved = savedIds.has(post.id);
+    try {
+      const result = saved
+        ? await supabase.from("saved_posts").delete().eq("user_id", session.user.id).eq("video_id", post.id)
+        : await supabase.from("saved_posts").insert({ user_id: session.user.id, video_id: post.id });
+      if (result.error) throw result.error;
+      setSavedIds((current) => {
+        const next = new Set(current);
+        if (saved) next.delete(post.id);
+        else next.add(post.id);
+        return next;
+      });
+      void Haptics.selectionAsync();
+    } catch (error) {
+      Alert.alert("Could not update saved posts", error instanceof Error ? error.message : "Please try again.");
+    }
   }
+
+  async function followCreator(post: FeedVideo) {
+    const { error } = await supabase.from("vibe_followers").insert({
+      follower_id: session.user.id,
+      followed_id: post.user_id,
+      source_vibe: post.vibe_tag,
+    });
+    if (error?.code === "23505") Alert.alert("Already following", `You already follow @${post.username}.`);
+    else if (error) Alert.alert("Could not follow creator", error.message);
+    else Alert.alert("Following", `You’re now following @${post.username}.`);
+  }
+
+  const openSheet = useCallback((post: FeedVideo, type: "comments" | "share" | "more" | "report") => {
+    setSheet({ post, type });
+  }, []);
+
+  const visibleVibes = useMemo(() => VIBES.filter((item) => !profile.hard_muted_vibes.includes(item)), [profile.hard_muted_vibes]);
 
   return (
     <View style={styles.screen}>
-      <View style={styles.topBar}>
-        <Text style={styles.wordmark}>vibed</Text>
-        <Text style={styles.greeting}>For you, {profile.display_name || profile.username}</Text>
+      <View style={styles.top}>
+        <View style={styles.heading}>
+          <Text style={styles.wordmark}>vibed</Text>
+          <Text style={styles.greeting}>Hi, {profile.display_name || profile.username}</Text>
+        </View>
+        <Text style={styles.dialLabel}>VIBE DIAL</Text>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chips}>
+          {visibleVibes.map((item) => (
+            <VibeChip key={item} vibe={item} active={item === vibe} onPress={() => setVibe(item)} />
+          ))}
+        </ScrollView>
       </View>
-      <View style={styles.vibes}>
-        {availableVibes.map((item) => {
-          const active = item === vibe;
-          return (
-            <Pressable
-              key={item}
-              onPress={() => setVibe(item)}
-              style={[
-                styles.vibePill,
-                active && { backgroundColor: `${VIBE_THEMES[item].accent}25`, borderColor: VIBE_THEMES[item].accent },
-              ]}
-            >
-              <Text style={[styles.vibeText, active && { color: VIBE_THEMES[item].accent }]}>
-                {item}
-              </Text>
-            </Pressable>
-          );
-        })}
-      </View>
-
       {error ? (
-        <EmptyState title="Feed unavailable" body={error} action={<Button onPress={() => void loadFeed(false)}>Try again</Button>} />
+        <EmptyState title="Vibe Room unavailable" body={error} action={<Button onPress={() => void loadFeed(false)}>Retry</Button>} />
       ) : loading ? (
-        <EmptyState title="Finding your vibe…" body="Loading videos from your community." />
-      ) : videos.length === 0 ? (
-        <EmptyState
-          title={`No ${vibe.toLowerCase()} videos yet`}
-          body="Be the first to post something for this vibe. Or try another room."
-          action={<Button onPress={() => setVibe(knownVibes[(knownVibes.indexOf(vibe) + 1) % knownVibes.length])}>Explore another vibe</Button>}
-        />
+        <EmptyState title="Tuning into your vibe…" body="Finding videos from your community." />
+      ) : posts.length === 0 ? (
+        <EmptyState title={`The ${vibe} room is quiet`} body="Be the first to post something with this vibe." />
       ) : (
         <FlatList
-          data={videos}
+          data={posts}
           keyExtractor={(item) => item.id}
           pagingEnabled
           showsVerticalScrollIndicator={false}
@@ -244,294 +280,207 @@ export function HomeScreen({
           viewabilityConfig={viewabilityConfig}
           onEndReached={() => void loadFeed(true)}
           onEndReachedThreshold={0.45}
-          ListFooterComponent={loadingMore ? <Text style={styles.loadingMore}>Loading more videos…</Text> : null}
+          ListFooterComponent={loadingMore ? <Text style={styles.loadingMore}>Finding more of your vibe…</Text> : null}
           renderItem={({ item }) => (
-            <VideoCard
-              video={item}
+            <PostCard
+              post={item}
               active={item.id === activeId}
+              autoplay={autoplay}
               liked={likedIds.has(item.id)}
+              saved={savedIds.has(item.id)}
+              commentCount={commentCounts[item.id] ?? 0}
               onLike={() => void toggleLike(item)}
-              onReport={() => reportVideo(item)}
-              onComments={() => setCommentVideo(item)}
+              onSave={() => void toggleSave(item)}
+              onFollow={() => void followCreator(item)}
+              onComments={() => openSheet(item, "comments")}
+              onShare={() => openSheet(item, "share")}
+              sharingAllowed={item.allow_sharing !== false}
+              commentsAllowed={item.allow_comments !== false}
+              onMore={() => openSheet(item, "more")}
+              onReport={() => openSheet(item, "report")}
             />
           )}
         />
       )}
-      <Modal
-        visible={commentVideo !== null}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setCommentVideo(null)}
-      >
-        {commentVideo ? (
-          <CommentsSheet
-            session={session}
-            video={commentVideo}
-            onClose={() => setCommentVideo(null)}
-          />
-        ) : null}
-      </Modal>
+      {sheet ? (
+        <PostSheets
+          session={session}
+          post={sheet.post}
+          initialSheet={sheet.type}
+          onNotInterested={() => {
+            setPosts((current) => current.filter((post) => post.id !== sheet.post.id));
+            setPinnedPost((current) => current?.id === sheet.post.id ? null : current);
+          }}
+          onClose={() => {
+            const postId = sheet.post.id;
+            setSheet(null);
+            void supabase.from("comments").select("id", { count: "exact", head: true }).eq("video_id", postId)
+              .then(({ count, error }) => {
+                if (error) Alert.alert("Could not refresh comment count", error.message);
+                else setCommentCounts((current) => ({ ...current, [postId]: count ?? 0 }));
+              });
+          }}
+        />
+      ) : null}
     </View>
   );
 }
 
-function VideoCard({
-  video,
+function PostCard({
+  post,
   active,
+  autoplay,
   liked,
+  saved,
+  commentCount,
   onLike,
-  onReport,
+  onSave,
+  onFollow,
   onComments,
+  onShare,
+  onMore,
+  onReport,
+  sharingAllowed,
+  commentsAllowed,
 }: {
-  video: FeedVideo;
+  post: FeedVideo;
   active: boolean;
+  autoplay: boolean;
   liked: boolean;
+  saved: boolean;
+  commentCount: number;
   onLike: () => void;
-  onReport: () => void;
+  onSave: () => void;
+  onFollow: () => void;
   onComments: () => void;
+  onShare: () => void;
+  onMore: () => void;
+  onReport: () => void;
+  sharingAllowed: boolean;
+  commentsAllowed: boolean;
 }) {
-  const player = useVideoPlayer(video.optimized_url);
+  const [paused, setPaused] = useState(false);
+  const [photoIndex, setPhotoIndex] = useState(0);
+  const lastTap = useRef(0);
+  const heartScale = useRef(new Animated.Value(0)).current;
+  const mediaUrls = post.media_urls?.length ? post.media_urls : post.optimized_url ? [post.optimized_url] : [];
+  const accent = VIBE_THEMES[post.vibe_tag]?.accent ?? colors.accent;
+  const isPhoto = post.media_type === "photo";
 
-  useEffect(() => {
-    player.loop = true;
-    player.muted = true;
-    if (active) player.play();
-    else player.pause();
-  }, [active, player]);
+  function tapMedia() {
+    const now = Date.now();
+    if (now - lastTap.current < 280) {
+      onLike();
+      setPaused(false);
+      heartScale.setValue(0);
+      Animated.sequence([
+        Animated.spring(heartScale, { toValue: 1, useNativeDriver: true, speed: 24, bounciness: 12 }),
+        Animated.delay(450),
+        Animated.timing(heartScale, { toValue: 0, duration: 180, useNativeDriver: true }),
+      ]).start();
+      lastTap.current = 0;
+      return;
+    }
+    lastTap.current = now;
+    if (!isPhoto) setPaused((value) => !value);
+  }
 
   return (
-    <View style={styles.card}>
-      <VideoView style={StyleSheet.absoluteFill} player={player} contentFit="cover" nativeControls={false} />
-      <View style={styles.scrim} pointerEvents="none" />
-      <View style={styles.videoContent}>
-        <View style={styles.creator}>
-          <Avatar uri={video.avatar_url} label={video.display_name || video.username} size={38} />
-          <View style={styles.creatorText}>
-            <Text style={styles.creatorName}>{video.display_name || video.username}</Text>
-            <Text style={styles.creatorHandle}>@{video.username} · {video.vibe_tag}</Text>
-          </View>
+    <View style={[styles.card, { height: viewportHeight }]}>
+      <Pressable onPress={tapMedia} style={StyleSheet.absoluteFill}>
+        {isPhoto ? (
+          <FlatList
+            data={mediaUrls}
+            horizontal
+            pagingEnabled
+            showsHorizontalScrollIndicator={false}
+            keyExtractor={(url, index) => `${url}-${index}`}
+            onMomentumScrollEnd={(event) => {
+              const width = event.nativeEvent.layoutMeasurement.width;
+              setPhotoIndex(Math.round(event.nativeEvent.contentOffset.x / width));
+            }}
+            renderItem={({ item }) => <Image source={{ uri: item }} style={styles.media} resizeMode="cover" />}
+          />
+        ) : post.optimized_url ? (
+          <VideoMedia uri={post.optimized_url} active={active} autoplay={autoplay} paused={paused} />
+        ) : null}
+      </Pressable>
+      <View pointerEvents="none" style={styles.scrim} />
+      <Animated.View pointerEvents="none" style={[styles.heartOverlay, { transform: [{ scale: heartScale }] }]}>
+        <Ionicons name="heart" size={88} color="#FFFFFF" />
+      </Animated.View>
+      {post.text_overlay ? <Text pointerEvents="none" style={styles.textOverlay}>{post.text_overlay}</Text> : null}
+      {!isPhoto && paused ? (
+        <View pointerEvents="none" style={styles.pauseOverlay}>
+          <Ionicons name="play" size={38} color="#FFFFFF" />
         </View>
-        <Text numberOfLines={3} style={styles.caption}>{video.caption || " "}</Text>
-        <View style={styles.cardFooter}>
-          <View style={styles.audio}>
-            <Text style={styles.audioText}>♫ {video.audio_attribution || "Original audio"}</Text>
+      ) : null}
+      <View style={styles.content}>
+        <View style={styles.bottom}>
+          <View style={styles.details}>
+            <Text style={styles.creator}>{post.display_name || post.username} <Text style={styles.handle}>@{post.username}</Text></Text>
+            <Text style={styles.caption}>{post.caption}</Text>
+            <Text style={styles.audio}>♫ {post.audio_attribution || `Original Audio by @${post.username}`}</Text>
+            {isPhoto && mediaUrls.length > 1 ? <Text style={styles.photoCount}>{photoIndex + 1} / {mediaUrls.length}</Text> : null}
           </View>
-          <View style={styles.actions}>
-            <Pressable accessibilityLabel={liked ? "Unlike video" : "Like video"} onPress={onLike} style={styles.action}>
-              <Text style={[styles.actionIcon, liked && styles.liked]}>{liked ? "♥" : "♡"}</Text>
-              <Text style={styles.actionLabel}>{video.like_count}</Text>
-            </Pressable>
-            <View style={styles.action}>
-              <Text style={styles.actionIcon}>◉</Text>
-              <Text style={styles.actionLabel}>{video.view_count}</Text>
-            </View>
-            <Pressable accessibilityLabel="View comments" onPress={onComments} style={styles.action}>
-              <Text style={styles.actionIcon}>▱</Text>
-              <Text style={styles.actionLabel}>Comment</Text>
-            </Pressable>
-            <Pressable accessibilityLabel="Report video" onPress={onReport} style={styles.action}>
-              <Text style={styles.actionIcon}>•••</Text>
-            </Pressable>
-          </View>
+          <PostActions
+            avatarUrl={post.avatar_url}
+            creatorName={post.display_name || post.username}
+            liked={liked}
+            saved={saved}
+            likeCount={post.like_count}
+            commentCount={commentCount}
+            accent={accent}
+            onFollow={onFollow}
+            onLike={onLike}
+            onComment={onComments}
+            onShare={onShare}
+            onSave={onSave}
+            onMore={onMore}
+            sharingAllowed={sharingAllowed}
+            commentsAllowed={commentsAllowed}
+          />
         </View>
       </View>
     </View>
   );
 }
 
-type StoredComment = { id: string; user_id: string; body: string; created_at: string };
-type Comment = StoredComment & { username: string; display_name: string; avatar_url: string | null };
-type CommentUser = { id: string; username: string; display_name: string; avatar_url: string | null };
-
-function CommentsSheet({
-  session,
-  video,
-  onClose,
-}: {
-  session: Session;
-  video: FeedVideo;
-  onClose: () => void;
-}) {
-  const [comments, setComments] = useState<Comment[]>([]);
-  const [body, setBody] = useState("");
-  const [loading, setLoading] = useState(true);
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const loadComments = useCallback(async () => {
-    setError(null);
-    try {
-      const { data, error: commentsError } = await supabase
-        .from("comments")
-        .select("id, user_id, body, created_at")
-        .eq("video_id", video.id)
-        .order("created_at", { ascending: true })
-        .limit(200);
-      if (commentsError) throw commentsError;
-      const stored = (data ?? []) as StoredComment[];
-      const userIds = [...new Set(stored.map((comment) => comment.user_id))];
-      let users: CommentUser[] = [];
-      if (userIds.length) {
-        const { data: userData, error: usersError } = await supabase
-          .from("users")
-          .select("id, username, display_name, avatar_url")
-          .in("id", userIds);
-        if (usersError) throw usersError;
-        users = (userData ?? []) as CommentUser[];
-      }
-      const byId = new Map(users.map((user) => [user.id, user]));
-      setComments(
-        stored.map((comment) => {
-          const user = byId.get(comment.user_id);
-          return {
-            ...comment,
-            username: user?.username ?? "vibed_user",
-            display_name: user?.display_name ?? "Vibed user",
-            avatar_url: user?.avatar_url ?? null,
-          };
-        }),
-      );
-    } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Comments could not be loaded.");
-    } finally {
-      setLoading(false);
-    }
-  }, [video.id]);
+function VideoMedia({ uri, active, autoplay, paused }: { uri: string; active: boolean; autoplay: boolean; paused: boolean }) {
+  const player = useVideoPlayer(uri, (instance) => {
+    instance.loop = true;
+    instance.muted = false;
+  });
 
   useEffect(() => {
-    void loadComments();
-  }, [loadComments]);
+    if (active && autoplay && !paused) player.play();
+    else player.pause();
+  }, [active, autoplay, paused, player]);
 
-  async function sendComment() {
-    const text = body.trim();
-    if (!text || sending) return;
-    setSending(true);
-    try {
-      const { error: insertError } = await supabase.from("comments").insert({
-        video_id: video.id,
-        user_id: session.user.id,
-        body: text,
-      });
-      if (insertError) throw insertError;
-      setBody("");
-      await loadComments();
-    } catch (sendError) {
-      Alert.alert("Comment not posted", sendError instanceof Error ? sendError.message : "Please try again.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  return (
-    <View style={styles.modalScrim}>
-      <KeyboardAvoidingView
-        style={styles.commentsSheet}
-        behavior={Platform.OS === "ios" ? "padding" : undefined}
-      >
-        <View style={styles.commentsHeader}>
-          <View>
-            <Text style={styles.commentsTitle}>Comments</Text>
-            <Text style={styles.commentsSubtitle}>@{video.username} · {video.vibe_tag}</Text>
-          </View>
-          <Pressable onPress={onClose} accessibilityLabel="Close comments">
-            <Text style={styles.closeComments}>Done</Text>
-          </Pressable>
-        </View>
-        {error ? (
-          <View style={styles.commentsEmpty}>
-            <Text style={styles.commentsError}>{error}</Text>
-            <Pressable onPress={() => void loadComments()}><Text style={styles.closeComments}>Try again</Text></Pressable>
-          </View>
-        ) : loading ? (
-          <View style={styles.commentsEmpty}><Text style={styles.commentsSubtitle}>Loading comments…</Text></View>
-        ) : comments.length === 0 ? (
-          <View style={styles.commentsEmpty}>
-            <Text style={styles.commentsTitle}>Start the conversation</Text>
-            <Text style={styles.commentsSubtitle}>Be the first to share a thought.</Text>
-          </View>
-        ) : (
-          <FlatList
-            data={comments}
-            keyExtractor={(item) => item.id}
-            contentContainerStyle={styles.commentsList}
-            renderItem={({ item }) => (
-              <View style={styles.commentRow}>
-                <Avatar uri={item.avatar_url} label={item.display_name || item.username} size={36} />
-                <View style={styles.commentBody}>
-                  <Text style={styles.commentName}>{item.display_name || item.username} <Text style={styles.commentHandle}>@{item.username}</Text></Text>
-                  <Text style={styles.commentText}>{item.body}</Text>
-                  <Text style={styles.commentTime}>{new Date(item.created_at).toLocaleDateString()}</Text>
-                </View>
-              </View>
-            )}
-          />
-        )}
-        <View style={styles.commentComposer}>
-          <TextInput
-            value={body}
-            onChangeText={setBody}
-            placeholder="Add a comment…"
-            placeholderTextColor={colors.muted}
-            maxLength={1000}
-            multiline
-            style={styles.commentInput}
-          />
-          <Pressable
-            onPress={() => void sendComment()}
-            disabled={!body.trim() || sending}
-            style={[styles.commentSend, (!body.trim() || sending) && styles.commentSendDisabled]}
-          >
-            <Text style={styles.commentSendText}>{sending ? "…" : "Post"}</Text>
-          </Pressable>
-        </View>
-      </KeyboardAvoidingView>
-    </View>
-  );
+  return <VideoView style={styles.media} player={player} contentFit="cover" nativeControls={false} />;
 }
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.background },
-  topBar: { height: 48, paddingHorizontal: 18, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  wordmark: { color: colors.text, fontSize: 22, fontWeight: "900", letterSpacing: -1 },
-  greeting: { color: colors.muted, fontSize: 13, maxWidth: "68%" },
-  vibes: { height: 52, flexDirection: "row", gap: 8, paddingHorizontal: 16, alignItems: "center" },
-  vibePill: { paddingHorizontal: 13, paddingVertical: 7, borderWidth: 1, borderColor: colors.border, borderRadius: 18, backgroundColor: colors.panel },
-  vibeText: { color: colors.muted, fontSize: 12, fontWeight: "700" },
-  card: { height: viewportHeight, marginHorizontal: 10, marginBottom: 8, overflow: "hidden", borderRadius: 22, backgroundColor: colors.panel },
+  top: { paddingTop: 4, paddingBottom: 8, backgroundColor: colors.background },
+  heading: { paddingHorizontal: 17, flexDirection: "row", alignItems: "center", justifyContent: "space-between", height: 35 },
+  wordmark: { color: colors.text, fontSize: 20, fontWeight: "900", letterSpacing: -1 },
+  greeting: { color: colors.muted, fontSize: 12 },
+  dialLabel: { color: colors.muted, fontSize: 9, fontWeight: "800", letterSpacing: 1.8, paddingHorizontal: 18, paddingTop: 3 },
+  chips: { gap: 8, paddingHorizontal: 15, paddingVertical: 8 },
+  card: { marginHorizontal: 8, marginBottom: 5, overflow: "hidden", borderRadius: 22, backgroundColor: colors.panel },
+  media: { width: Dimensions.get("window").width - 16, height: "100%" },
   scrim: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.12)" },
-  videoContent: { flex: 1, justifyContent: "flex-end", padding: 18 },
-  creator: { flexDirection: "row", alignItems: "center", gap: 10, marginBottom: 12 },
-  creatorText: { flex: 1 },
-  creatorName: { color: "#FFFFFF", fontSize: 15, fontWeight: "800" },
-  creatorHandle: { color: "#E4E4E7", fontSize: 12, marginTop: 2 },
-  caption: { maxWidth: "82%", color: "#FFFFFF", fontSize: 15, lineHeight: 21, fontWeight: "600", marginBottom: 10 },
-  cardFooter: { flexDirection: "row", alignItems: "flex-end", justifyContent: "space-between" },
-  audio: { flex: 1, paddingRight: 8 },
-  audioText: { color: "#FFFFFF", fontSize: 12, fontWeight: "600" },
-  actions: { gap: 12, alignItems: "center" },
-  action: { minWidth: 34, alignItems: "center", gap: 2 },
-  actionIcon: { color: "#FFFFFF", fontSize: 24, fontWeight: "700" },
-  liked: { color: "#FB7185" },
-  actionLabel: { color: "#FFFFFF", fontSize: 11, fontWeight: "700" },
-  modalScrim: { flex: 1, justifyContent: "flex-end", backgroundColor: "rgba(0,0,0,0.65)" },
-  commentsSheet: { height: "82%", paddingTop: 19, paddingHorizontal: 16, paddingBottom: 10, borderTopLeftRadius: 24, borderTopRightRadius: 24, backgroundColor: colors.background },
-  commentsHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingBottom: 14, borderBottomWidth: 1, borderColor: colors.border },
-  commentsTitle: { color: colors.text, fontSize: 18, fontWeight: "800" },
-  commentsSubtitle: { color: colors.muted, fontSize: 12, marginTop: 4 },
-  closeComments: { color: colors.mint, fontSize: 14, fontWeight: "700", padding: 8 },
-  commentsEmpty: { flex: 1, alignItems: "center", justifyContent: "center", gap: 8 },
-  commentsError: { color: "#FCA5A5", textAlign: "center" },
-  commentsList: { gap: 16, paddingVertical: 16 },
-  commentRow: { flexDirection: "row", alignItems: "flex-start", gap: 10 },
-  commentBody: { flex: 1, gap: 4 },
-  commentName: { color: colors.text, fontSize: 13, fontWeight: "700" },
-  commentHandle: { color: colors.muted, fontSize: 11, fontWeight: "400" },
-  commentText: { color: "#E4E4E7", fontSize: 14, lineHeight: 20 },
-  commentTime: { color: colors.muted, fontSize: 10 },
-  commentComposer: { flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 10, borderTopWidth: 1, borderColor: colors.border },
-  commentInput: { flex: 1, maxHeight: 100, paddingHorizontal: 13, paddingVertical: 10, borderWidth: 1, borderColor: colors.border, borderRadius: 16, color: colors.text, backgroundColor: colors.panel, fontSize: 14 },
-  commentSend: { paddingVertical: 11, paddingHorizontal: 13, borderRadius: 14, backgroundColor: colors.accent },
-  commentSendDisabled: { opacity: 0.45 },
-  commentSendText: { color: colors.text, fontWeight: "800" },
+  heartOverlay: { position: "absolute", left: "40%", top: "38%", shadowColor: "#000000", shadowOpacity: 0.3, shadowRadius: 12 },
+  textOverlay: { position: "absolute", left: 28, right: 80, top: "38%", color: "#FFFFFF", fontSize: 22, fontWeight: "900", textAlign: "center", textShadowColor: "#000000", textShadowRadius: 6 },
+  pauseOverlay: { position: "absolute", left: "44%", top: "42%", width: 52, height: 52, borderRadius: 26, alignItems: "center", justifyContent: "center", backgroundColor: "rgba(0,0,0,0.35)" },
+  content: { ...StyleSheet.absoluteFillObject, justifyContent: "flex-end", paddingHorizontal: 15, paddingBottom: 16 },
+  bottom: { flexDirection: "row", alignItems: "flex-end", gap: 8 },
+  details: { flex: 1, gap: 8, paddingBottom: 8 },
+  creator: { color: "#FFFFFF", fontSize: 15, fontWeight: "800", textShadowColor: "#000000", textShadowRadius: 4 },
+  handle: { color: "#E4E4E7", fontSize: 12, fontWeight: "500" },
+  caption: { color: "#FFFFFF", fontSize: 14, lineHeight: 20, textShadowColor: "#000000", textShadowRadius: 4 },
+  audio: { color: "#FFFFFF", fontSize: 12, fontWeight: "600", textShadowColor: "#000000", textShadowRadius: 4 },
+  photoCount: { color: "#FFFFFF", fontSize: 11 },
   loadingMore: { color: colors.muted, textAlign: "center", paddingVertical: 16 },
 });

@@ -2,14 +2,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   FlatList,
+  Image,
   KeyboardAvoidingView,
   Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
 } from "react-native";
 import type { Session } from "@supabase/supabase-js";
+import { Ionicons } from "@expo/vector-icons";
 
 import { Avatar, Button, colors, EmptyState, Field, Heading, Screen } from "../components/ui";
 import { supabase } from "../services/supabase";
@@ -22,14 +25,22 @@ type Message = {
   body: string;
   created_at: string;
   read_at: string | null;
+  shared_video_id?: string | null;
+  attachment_url?: string | null;
+  attachment_urls?: string[];
+  attachment_type?: "video" | "photo" | null;
 };
 type Contact = Pick<UserProfile, "id" | "username" | "display_name" | "avatar_url">;
 type Conversation = { contact: Contact; lastMessage: Message };
 
 export function InboxScreen({
   session,
+  initialContactId,
+  onInitialContactHandled,
 }: {
   session: Session;
+  initialContactId?: string;
+  onInitialContactHandled: () => void;
 }) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -43,7 +54,7 @@ export function InboxScreen({
     try {
       const { data: messages, error: messagesError } = await supabase
         .from("messages")
-        .select("id, sender_id, recipient_id, body, created_at, read_at")
+        .select("id, sender_id, recipient_id, body, created_at, read_at, shared_video_id, attachment_url, attachment_urls, attachment_type")
         .or(`sender_id.eq.${session.user.id},recipient_id.eq.${session.user.id}`)
         .order("created_at", { ascending: false })
         .limit(250);
@@ -102,6 +113,26 @@ export function InboxScreen({
   useEffect(() => {
     void loadInbox();
   }, [loadInbox]);
+
+  useEffect(() => {
+    if (!initialContactId) return;
+    let active = true;
+    void supabase.from("users")
+      .select("id, username, display_name, avatar_url")
+      .eq("id", initialContactId)
+      .single()
+      .then(({ data, error }) => {
+        if (!active) return;
+        if (error) {
+          Alert.alert("Could not open conversation", error.message);
+          onInitialContactHandled();
+          return;
+        }
+        setSelected(data as Contact);
+        onInitialContactHandled();
+      });
+    return () => { active = false; };
+  }, [initialContactId, onInitialContactHandled]);
 
   if (selected) {
     return (
@@ -199,7 +230,7 @@ function Thread({
     setError(null);
     const { data, error: loadError } = await supabase
       .from("messages")
-      .select("id, sender_id, recipient_id, body, created_at, read_at")
+      .select("id, sender_id, recipient_id, body, created_at, read_at, shared_video_id, attachment_url, attachment_urls, attachment_type")
       .or(
         `and(sender_id.eq.${session.user.id},recipient_id.eq.${contact.id}),and(sender_id.eq.${contact.id},recipient_id.eq.${session.user.id})`,
       )
@@ -281,6 +312,18 @@ function Thread({
               const own = item.sender_id === session.user.id;
               return (
                 <View style={[styles.bubble, own ? styles.ownBubble : styles.theirBubble]}>
+                  {item.attachment_type === "photo" && (item.attachment_urls?.length || item.attachment_url) ? (
+                    <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.sharedPhotoList}>
+                      {(item.attachment_urls?.length ? item.attachment_urls : [item.attachment_url]).map((url, index) => url ? (
+                        <Image key={`${url}-${index}`} source={{ uri: url }} style={styles.sharedPhoto} resizeMode="cover" />
+                      ) : null)}
+                    </ScrollView>
+                  ) : item.attachment_url && item.attachment_type === "video" ? (
+                    <View style={styles.sharedVideo}>
+                      <Ionicons name="play-circle" size={38} color={colors.text} />
+                      <Text style={styles.sharedLabel}>Shared video</Text>
+                    </View>
+                  ) : null}
                   <Text style={styles.messageText}>{item.body}</Text>
                   <Text style={styles.time}>
                     {new Date(item.created_at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
@@ -337,6 +380,10 @@ const styles = StyleSheet.create({
   ownBubble: { alignSelf: "flex-end", backgroundColor: "#482567", borderBottomRightRadius: 5 },
   theirBubble: { alignSelf: "flex-start", backgroundColor: colors.panelRaised, borderBottomLeftRadius: 5 },
   messageText: { color: colors.text, fontSize: 14, lineHeight: 20 },
+  sharedPhoto: { width: 220, height: 190, borderRadius: 12, marginBottom: 5 },
+  sharedPhotoList: { gap: 6 },
+  sharedVideo: { width: 220, height: 120, alignItems: "center", justifyContent: "center", gap: 4, borderRadius: 12, marginBottom: 5, backgroundColor: "#30213D" },
+  sharedLabel: { color: colors.text, fontSize: 11, fontWeight: "700" },
   time: { alignSelf: "flex-end", color: "#C4B5FD", fontSize: 10 },
   composer: { flexDirection: "row", alignItems: "flex-end", gap: 8, padding: 12, borderTopWidth: 1, borderColor: colors.border },
   messageInput: { flex: 1, minHeight: 45, maxHeight: 120, paddingTop: 12 },

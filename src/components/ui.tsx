@@ -7,12 +7,17 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  useColorScheme,
   View,
   type PressableProps,
   type TextInputProps,
   type ViewProps,
 } from "react-native";
+import { LinearGradient } from "expo-linear-gradient";
+import { Ionicons } from "@expo/vector-icons";
 import { SafeAreaView } from "react-native-safe-area-context";
+import { GENRE_THEMES, VIBE_THEMES, type GenreName, type VibeName } from "../config/vibes";
+import { useAppStore } from "../store/appStore";
 
 export const colors = {
   background: "#0A0A0C",
@@ -31,8 +36,12 @@ export function Screen({
   scroll = false,
   style,
 }: PropsWithChildren<{ scroll?: boolean } & ViewProps>) {
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
+  const backgroundColor = light ? "#F7F7FA" : colors.background;
   return (
-    <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
+    <SafeAreaView style={[styles.safeArea, { backgroundColor }]} edges={["top", "bottom"]}>
       {scroll ? (
         <ScrollView
           contentContainerStyle={[styles.scrollContent, style]}
@@ -54,10 +63,13 @@ export function Heading({
   title: string;
   subtitle?: string;
 }) {
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
   return (
     <View style={styles.heading}>
-      <Text style={styles.headingTitle}>{title}</Text>
-      {subtitle ? <Text style={styles.muted}>{subtitle}</Text> : null}
+      <Text style={[styles.headingTitle, light && styles.lightText]}>{title}</Text>
+      {subtitle ? <Text style={[styles.muted, light && styles.lightMuted]}>{subtitle}</Text> : null}
     </View>
   );
 }
@@ -75,6 +87,10 @@ export function Button({
     variant?: "primary" | "secondary" | "quiet" | "danger";
   }
 >) {
+  const accentColor = useAppStore((state) => state.settings.accentColor);
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
   return (
     <Pressable
       accessibilityRole="button"
@@ -82,7 +98,8 @@ export function Button({
       disabled={disabled || loading}
       style={({ pressed }) => [
         styles.button,
-        variant === "secondary" && styles.buttonSecondary,
+        variant === "primary" && { backgroundColor: accentColor },
+        variant === "secondary" && [styles.buttonSecondary, light && styles.lightSecondary],
         variant === "quiet" && styles.buttonQuiet,
         variant === "danger" && styles.buttonDanger,
         (disabled || loading) && styles.buttonDisabled,
@@ -104,14 +121,17 @@ export function Field({
   multiline = false,
   ...props
 }: TextInputProps & { label?: string }) {
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
   return (
     <View style={styles.fieldWrap}>
-      {label ? <Text style={styles.fieldLabel}>{label}</Text> : null}
+      {label ? <Text style={[styles.fieldLabel, light && styles.lightMuted]}>{label}</Text> : null}
       <TextInput
-        placeholderTextColor={colors.muted}
+        placeholderTextColor={light ? "#71717A" : colors.muted}
         {...props}
         multiline={multiline}
-        style={[styles.field, multiline && styles.multiline, props.style]}
+        style={[styles.field, light && styles.lightField, multiline && styles.multiline, props.style]}
       />
     </View>
   );
@@ -150,12 +170,80 @@ export function EmptyState({
   body: string;
   action?: ReactNode;
 }) {
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
   return (
     <View style={styles.empty}>
-      <Text style={styles.emptyTitle}>{title}</Text>
-      <Text style={styles.muted}>{body}</Text>
+      <Text style={[styles.emptyTitle, light && styles.lightText]}>{title}</Text>
+      <Text style={[styles.muted, light && styles.lightMuted]}>{body}</Text>
       {action}
     </View>
+  );
+}
+
+export function VibeChip({
+  vibe,
+  active,
+  onPress,
+  compact = false,
+}: {
+  vibe: VibeName;
+  active?: boolean;
+  onPress?: () => void;
+  compact?: boolean;
+}) {
+  const theme = VIBE_THEMES[vibe];
+  const paletteTheme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = paletteTheme === "light" || (paletteTheme === "system" && systemScheme === "light");
+  return (
+    <Pressable onPress={onPress} disabled={!onPress}>
+      <LinearGradient
+        colors={active ? theme.gradient : [light ? "#FFFFFF" : "#18181D", light ? "#FFFFFF" : "#18181D"]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={[
+          styles.vibeChip,
+          compact && styles.vibeChipCompact,
+          { borderColor: active ? theme.accent : light ? "#D4D4D8" : colors.border },
+        ]}
+      >
+        <View style={styles.vibeChipContent}>
+          <Ionicons name={theme.icon as keyof typeof Ionicons.glyphMap} size={compact ? 13 : 16} color={active ? "#FFFFFF" : light ? "#52525B" : colors.muted} />
+          <Text style={{ color: active ? "#FFFFFF" : light ? "#52525B" : colors.muted, fontSize: compact ? 11 : 13, fontWeight: "700" }}>{vibe}</Text>
+        </View>
+      </LinearGradient>
+    </Pressable>
+  );
+}
+
+export function GenreChip({
+  genre,
+  active,
+  onPress,
+}: {
+  genre: GenreName;
+  active?: boolean;
+  onPress?: () => void;
+}) {
+  const theme = GENRE_THEMES[genre];
+  const selected = Boolean(active);
+  const paletteTheme = useAppStore((state) => state.settings.theme);
+  const systemScheme = useColorScheme();
+  const light = paletteTheme === "light" || (paletteTheme === "system" && systemScheme === "light");
+  return (
+    <Pressable onPress={onPress} disabled={!onPress}>
+      <LinearGradient
+        colors={selected ? theme.gradient : [light ? "#FFFFFF" : "#18181D", light ? "#FFFFFF" : "#18181D"]}
+        start={{ x: 0, y: 0 }}
+        end={{ x: 1, y: 1 }}
+        style={[styles.genreChip, { borderColor: selected ? theme.accent : light ? "#D4D4D8" : colors.border }]}
+      >
+        <Ionicons name={theme.icon as keyof typeof Ionicons.glyphMap} size={16} color={selected ? "#FFFFFF" : light ? "#52525B" : colors.muted} />
+        <Text style={{ color: selected ? "#FFFFFF" : light ? "#52525B" : colors.muted, fontSize: 12, fontWeight: "700" }}>{genre}</Text>
+      </LinearGradient>
+    </Pressable>
   );
 }
 
@@ -197,4 +285,12 @@ const styles = StyleSheet.create({
   avatarInitial: { color: colors.mint, fontWeight: "800" },
   empty: { flex: 1, minHeight: 180, alignItems: "center", justifyContent: "center", padding: 28, gap: 10 },
   emptyTitle: { color: colors.text, fontSize: 19, fontWeight: "700", textAlign: "center" },
+  vibeChip: { paddingHorizontal: 15, paddingVertical: 10, borderRadius: 18, borderWidth: 1 },
+  vibeChipCompact: { paddingHorizontal: 10, paddingVertical: 7 },
+  vibeChipContent: { flexDirection: "row", alignItems: "center", gap: 5 },
+  genreChip: { minHeight: 46, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 11, paddingVertical: 8, borderRadius: 13, borderWidth: 1 },
+  lightText: { color: "#18181B" },
+  lightMuted: { color: "#71717A" },
+  lightField: { color: "#18181B", backgroundColor: "#FFFFFF", borderColor: "#D4D4D8" },
+  lightSecondary: { backgroundColor: "#E4E4E7", borderColor: "#D4D4D8" },
 });

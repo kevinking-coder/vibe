@@ -1,38 +1,69 @@
 import type { ImagePickerAsset } from "expo-image-picker";
+import * as FileSystem from "expo-file-system/legacy";
 
-import { supabase } from "./supabase";
+const cloudName = process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME;
+const uploadPreset = process.env.EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET;
 
-async function uploadAsset(
-  bucket: "videos" | "avatars",
-  asset: ImagePickerAsset,
-  userId: string,
+export async function uploadMedia(
+  asset: Pick<ImagePickerAsset, "uri" | "mimeType">,
+  onProgress?: (progress: number) => void,
 ): Promise<string> {
-  const response = await fetch(asset.uri);
-  if (!response.ok) {
-    throw new Error(`Could not read selected media (${response.status}).`);
+  if (!cloudName || !uploadPreset) {
+    throw new Error(
+      "Cloudinary uploads are not configured. Set EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME and EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET in the EAS build environment.",
+    );
   }
 
-  const file = await response.arrayBuffer();
-  const extension =
-    asset.fileName?.split(".").pop()?.toLowerCase().replace(/[^a-z0-9]/g, "") ||
-    (asset.mimeType?.split("/").pop() ?? (bucket === "videos" ? "mp4" : "jpg"));
-  const path = `${userId}/${Date.now()}-${Math.random().toString(36).slice(2)}.${extension}`;
-  const { error } = await supabase.storage.from(bucket).upload(path, file, {
-    contentType: asset.mimeType ?? (bucket === "videos" ? "video/mp4" : "image/jpeg"),
-    upsert: false,
-  });
+  const task = FileSystem.createUploadTask(
+    `https://api.cloudinary.com/v1_1/${cloudName}/auto/upload`,
+    asset.uri,
+    {
+      httpMethod: "POST",
+      uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+      fieldName: "file",
+      mimeType: asset.mimeType ?? undefined,
+      parameters: { upload_preset: uploadPreset },
+    },
+    (progress) => {
+      if (progress.totalBytesExpectedToSend > 0) {
+        onProgress?.(progress.totalBytesSent / progress.totalBytesExpectedToSend);
+      }
+    },
+  );
+  const response = await task.uploadAsync();
+  if (!response) throw new Error("Cloudinary upload was cancelled.");
 
-  if (error) {
-    throw error;
+  let payload: { secure_url?: string; error?: { message?: string } };
+  try {
+    payload = JSON.parse(response.body) as typeof payload;
+  } catch {
+    throw new Error("Cloudinary returned an unreadable upload response.");
+  }
+  if (response.status < 200 || response.status >= 300 || !payload.secure_url) {
+    throw new Error(payload.error?.message ?? `Cloudinary upload failed (${response.status}).`);
   }
 
-  return supabase.storage.from(bucket).getPublicUrl(path).data.publicUrl;
+  return payload.secure_url;
 }
 
-export function uploadVideo(asset: ImagePickerAsset, userId: string) {
-  return uploadAsset("videos", asset, userId);
+export const uploadVideo = uploadMedia;
+export const uploadAvatar = uploadMedia;
+
+export function withVideoTrim(url: string, startSeconds: number, endSeconds: number): string {
+  if (!Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || startSeconds < 0 || endSeconds <= startSeconds) {
+    throw new Error("Choose a valid video trim range.");
+  }
+  const marker = "/video/upload/";
+  const markerIndex = url.indexOf(marker);
+  if (markerIndex < 0) throw new Error("Cloudinary did not return a video URL that can be trimmed.");
+  const insertionPoint = markerIndex + marker.length;
+  return `${url.slice(0, insertionPoint)}so_${startSeconds},eo_${endSeconds},f_auto,q_auto/${url.slice(insertionPoint)}`;
 }
 
-export function uploadAvatar(asset: ImagePickerAsset, userId: string) {
-  return uploadAsset("avatars", asset, userId);
+export function optimizeMediaUrl(url: string): string {
+  const marker = "/image/upload/";
+  const markerIndex = url.indexOf(marker);
+  if (markerIndex < 0) return url;
+  const insertionPoint = markerIndex + marker.length;
+  return `${url.slice(0, insertionPoint)}f_auto,q_auto,w_1080,c_limit/${url.slice(insertionPoint)}`;
 }

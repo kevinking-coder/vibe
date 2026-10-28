@@ -1,6 +1,7 @@
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
-import { NavigationContainer } from "@react-navigation/native";
-import { Text } from "react-native";
+import { NavigationContainer, type LinkingOptions } from "@react-navigation/native";
+import { useColorScheme } from "react-native";
+import { Ionicons } from "@expo/vector-icons";
 import type { Session } from "@supabase/supabase-js";
 
 import { colors } from "../components/ui";
@@ -11,8 +12,19 @@ import { DiscoverScreen } from "../screens/DiscoverScreen";
 import { HomeScreen } from "../screens/HomeScreen";
 import { InboxScreen } from "../screens/InboxScreen";
 import { ProfileScreen } from "../screens/ProfileScreen";
+import { useAppStore } from "../store/appStore";
 
 const Tab = createBottomTabNavigator<MainTabParamList>();
+const linking: LinkingOptions<MainTabParamList> = {
+  prefixes: ["vibed://"],
+  config: {
+    screens: {
+      Home: "post/:postId",
+      Profile: "creator/:username",
+      Inbox: "inbox/:contactId",
+    },
+  },
+};
 
 export function MainTabs({
   session,
@@ -23,8 +35,12 @@ export function MainTabs({
   profile: UserProfile;
   onProfileUpdated: (profile: UserProfile) => void;
 }) {
+  const theme = useAppStore((state) => state.settings.theme);
+  const accentColor = useAppStore((state) => state.settings.accentColor);
+  const systemScheme = useColorScheme();
+  const light = theme === "light" || (theme === "system" && systemScheme === "light");
   return (
-    <NavigationContainer>
+    <NavigationContainer linking={linking}>
       <Tab.Navigator
         screenOptions={({ route }) => ({
           headerShown: false,
@@ -32,42 +48,67 @@ export function MainTabs({
             height: 66,
             paddingTop: 7,
             paddingBottom: 8,
-            backgroundColor: colors.background,
-            borderTopColor: colors.border,
+            backgroundColor: light ? "#FFFFFF" : colors.background,
+            borderTopColor: light ? "#D4D4D8" : colors.border,
           },
-          tabBarActiveTintColor: colors.mint,
-          tabBarInactiveTintColor: colors.muted,
+          tabBarActiveTintColor: accentColor,
+          tabBarInactiveTintColor: light ? "#71717A" : colors.muted,
           tabBarLabelStyle: { fontSize: 10, fontWeight: "600" },
           tabBarIcon: ({ focused, color }) => {
-            const symbols: Record<keyof MainTabParamList, string> = {
-              Home: "⌂",
-              Discover: "⌕",
-              Upload: "+",
-              Inbox: "♡",
-              Profile: "●",
+            const symbols: Record<keyof MainTabParamList, keyof typeof Ionicons.glyphMap> = {
+              Home: focused ? "home" : "home-outline",
+              Discover: "search-outline",
+              Upload: focused ? "add-circle" : "add-circle-outline",
+              Inbox: focused ? "chatbubble-ellipses" : "chatbubble-ellipses-outline",
+              Profile: focused ? "person-circle" : "person-circle-outline",
             };
-            return (
-              <Text style={{ color, fontSize: focused ? 23 : 21, fontWeight: "700", lineHeight: 25 }}>
-                {symbols[route.name]}
-              </Text>
-            );
+            return <Ionicons name={symbols[route.name]} size={focused ? 23 : 21} color={color} />;
           },
         })}
       >
-        <Tab.Screen name="Home" options={{ title: "For you" }}>
-          {() => <HomeScreen session={session} profile={profile} />}
+        <Tab.Screen name="Home" options={{ title: "Vibe Room" }}>
+          {({ navigation, route }) => (
+            <HomeScreen
+              session={session}
+              profile={profile}
+              deepLinkPostId={route.params?.postId}
+              onDeepLinkHandled={() => navigation.setParams({ postId: undefined })}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen name="Discover" options={{ title: "Explore" }}>
-          {() => <DiscoverScreen session={session} profile={profile} />}
+          {({ navigation }) => (
+            <DiscoverScreen
+              session={session}
+              profile={profile}
+              onOpenCreator={(username) => navigation.navigate("Profile", { username })}
+              onOpenPost={(postId) => navigation.navigate("Home", { postId })}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen name="Upload" options={{ title: "Create" }}>
           {() => <CreateScreen session={session} profile={profile} />}
         </Tab.Screen>
         <Tab.Screen name="Inbox" options={{ title: "Inbox" }}>
-          {() => <InboxScreen session={session} />}
+          {({ navigation, route }) => (
+            <InboxScreen
+              session={session}
+              initialContactId={route.params?.contactId}
+              onInitialContactHandled={() => navigation.setParams({ contactId: undefined })}
+            />
+          )}
         </Tab.Screen>
         <Tab.Screen name="Profile" options={{ title: "You" }}>
-          {() => <ProfileScreen session={session} profile={profile} onProfileUpdated={onProfileUpdated} />}
+          {({ navigation, route }) => (
+            <ProfileScreen
+              session={session}
+              profile={profile}
+              creatorUsername={route.params?.username}
+              onProfileUpdated={onProfileUpdated}
+              onMessageCreator={(contactId) => navigation.navigate("Inbox", { contactId })}
+              onClosePublicProfile={() => navigation.navigate("Profile", {})}
+            />
+          )}
         </Tab.Screen>
       </Tab.Navigator>
     </NavigationContainer>
