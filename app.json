@@ -8,6 +8,25 @@
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "scheme": "vibed",
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Vibed uses your photos to create posts and update your profile.",
+          "cameraPermission": "Vibed uses your camera to capture posts and profile photos.",
+          "microphonePermission": "Vibed uses your microphone when recording a video post."
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Vibed needs photo library access to save posts to your device.",
+          "savePhotosPermission": "Vibed needs permission to save posts to your photo library.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ],
+      "expo-font"
+    ],
     "android": {
       "package": "com.vibed.app",
       "adaptiveIcon": {

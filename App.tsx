@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Alert, StyleSheet, Text, useColorScheme, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import type { Session } from "@supabase/supabase-js";
 import { SafeAreaProvider } from "react-native-safe-area-context";
@@ -11,6 +11,9 @@ import type { UserProfile } from "./src/types/app";
 import { AuthScreen } from "./src/screens/AuthScreen";
 import { OnboardingScreen } from "./src/screens/OnboardingScreen";
 import { MainTabs } from "./src/navigation/MainTabs";
+import { DEFAULT_USER_SETTINGS } from "./src/config/settings";
+import { useAppStore } from "./src/store/appStore";
+import { VIBES, type VibeName } from "./src/config/vibes";
 
 export default function App() {
   return (
@@ -26,18 +29,36 @@ function AppContent() {
   const [starting, setStarting] = useState(true);
   const [loadingProfile, setLoadingProfile] = useState(false);
   const [profileError, setProfileError] = useState<string | null>(null);
+  const setSettings = useAppStore((state) => state.setSettings);
+  const setStoreSession = useAppStore((state) => state.setSession);
+  const setStoreProfile = useAppStore((state) => state.setProfile);
+  const setActiveVibeRoom = useAppStore((state) => state.setActiveVibeRoom);
+  const theme = useAppStore((state) => state.settings.theme);
+  const systemColorScheme = useColorScheme();
+  const statusBarStyle = theme === "light" || (theme === "system" && systemColorScheme === "light") ? "dark" : "light";
 
   useEffect(() => {
     let active = true;
     const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      if (active) setSession(nextSession);
+      if (active) {
+        setSession(nextSession);
+        setStoreSession(nextSession);
+        if (!nextSession) {
+          setProfile(null);
+          setStoreProfile(null);
+          setSettings(DEFAULT_USER_SETTINGS);
+        }
+      }
     });
 
     supabase.auth
       .getSession()
       .then(({ data: result, error }) => {
         if (error) throw error;
-        if (active) setSession(result.session);
+        if (active) {
+          setSession(result.session);
+          setStoreSession(result.session);
+        }
       })
       .catch((error: unknown) => {
         Alert.alert("Could not restore your session", error instanceof Error ? error.message : "Please reopen the app.");
@@ -50,11 +71,12 @@ function AppContent() {
       active = false;
       data.subscription.unsubscribe();
     };
-  }, []);
+  }, [setSettings, setStoreProfile, setStoreSession]);
 
   const loadProfile = useCallback(async () => {
     if (!session) {
       setProfile(null);
+      setStoreProfile(null);
       setProfileError(null);
       return;
     }
@@ -62,27 +84,48 @@ function AppContent() {
     setLoadingProfile(true);
     setProfileError(null);
     try {
-      const { data, error } = await supabase
+      const [{ data, error }, { data: settingsRow, error: settingsError }] = await Promise.all([
+        supabase
         .from("users")
-        .select("id, username, display_name, bio, avatar_url, vibe_tags, hard_muted_vibes, onboarding_complete")
+        .select("id, username, display_name, bio, avatar_url, cover_url, website, is_private, vibe_tags, hard_muted_vibes, onboarding_complete")
         .eq("id", session.user.id)
-        .single();
+        .single(),
+        supabase.from("user_settings").select("settings").eq("user_id", session.user.id).maybeSingle(),
+      ]);
       if (error) throw error;
+      if (settingsError) throw settingsError;
       setProfile(data as UserProfile);
+      setStoreProfile(data as UserProfile);
+      const settings = {
+        ...DEFAULT_USER_SETTINGS,
+        ...((settingsRow?.settings ?? {}) as Partial<typeof DEFAULT_USER_SETTINGS>),
+        notifications: {
+          ...DEFAULT_USER_SETTINGS.notifications,
+          ...((settingsRow?.settings?.notifications ?? {}) as Partial<typeof DEFAULT_USER_SETTINGS.notifications>),
+        },
+      };
+      setSettings(settings);
+      if (VIBES.includes(settings.defaultVibe as VibeName)) setActiveVibeRoom(settings.defaultVibe as VibeName);
     } catch (error) {
       setProfileError(error instanceof Error ? error.message : "Could not load your profile.");
     } finally {
       setLoadingProfile(false);
     }
-  }, [session]);
+  }, [session, setActiveVibeRoom, setSettings, setStoreProfile]);
 
   useEffect(() => {
     if (!starting) void loadProfile();
   }, [loadProfile, starting]);
 
+  const updateProfile = useCallback((nextProfile: UserProfile) => {
+    setProfile(nextProfile);
+    setStoreProfile(nextProfile);
+  }, [setStoreProfile]);
+
   async function completeOnboarding(vibes: string[]) {
     if (!profile) return;
-    setProfile({ ...profile, vibe_tags: vibes, onboarding_complete: true });
+    updateProfile({ ...profile, vibe_tags: vibes, onboarding_complete: true });
+    if (vibes[0] && VIBES.includes(vibes[0] as VibeName)) setActiveVibeRoom(vibes[0] as VibeName);
   }
 
   if (starting) {
@@ -91,7 +134,7 @@ function AppContent() {
   if (!session) {
     return (
       <>
-        <StatusBar style="light" />
+        <StatusBar style={statusBarStyle} />
         <AuthScreen />
       </>
     );
@@ -116,7 +159,7 @@ function AppContent() {
   if (!profile.onboarding_complete) {
     return (
       <>
-        <StatusBar style="light" />
+        <StatusBar style={statusBarStyle} />
         <OnboardingScreen session={session} onComplete={completeOnboarding} />
       </>
     );
@@ -124,11 +167,11 @@ function AppContent() {
 
   return (
     <>
-      <StatusBar style="light" />
+      <StatusBar style={statusBarStyle} />
       <MainTabs
         session={session}
         profile={profile}
-        onProfileUpdated={setProfile}
+        onProfileUpdated={updateProfile}
       />
     </>
   );
